@@ -5,6 +5,10 @@ import unittest
 import numpy as np
 
 from aci_state_builder.formats import StateFormatError, read_csv, to_frame, write_csv
+from aci_state_builder.energy import (
+    EnergyParameters, calculate_energy, dipole_prefactor_pn_nm_um3,
+    geometric_dipole_sum_pbc,
+)
 from aci_state_builder.geometry import periodic_square, periodic_vertex_charges
 from aci_state_builder.model import IceDocument
 from aci_state_builder.presets import af2, af4
@@ -41,6 +45,15 @@ class GeometryTests(unittest.TestCase):
         document.restore_snapshot(before)
         self.assertEqual(document.traps[0].occupancy, 1)
         np.testing.assert_allclose(document.traps[0].displacement, [1.2, 0.1, 0.0])
+
+    def test_charge_is_in_minus_out_across_periodic_seam(self) -> None:
+        document = periodic_square(2, 2, 8.0, 3.0)
+        # Flipping the horizontal trap from x=1 to x=0 reverses a seam-crossing edge.
+        document.flip_indices([1])
+        charge = periodic_vertex_charges(document)
+        self.assertEqual(int(charge[0, 1]), 2)
+        self.assertEqual(int(charge[0, 0]), -2)
+        self.assertEqual(int(charge.sum()), 0)
 
 
 class FormatTests(unittest.TestCase):
@@ -88,6 +101,29 @@ class FormatTests(unittest.TestCase):
         loaded = read_csv(fixture)
         expected = periodic_square(10, 10, loaded.lattice_constant, loaded.trap_separation)
         np.testing.assert_array_equal(loaded.occupancies(), af4(expected))
+
+
+class EnergyTests(unittest.TestCase):
+    def test_two_particle_energy_and_minimum_image(self) -> None:
+        positions = np.array([[0.5, 0, 0], [9.5, 0, 0]])
+        # They are one micrometre apart through the periodic x seam and parallel to B.
+        self.assertAlmostEqual(geometric_dipole_sum_pbc(positions, (10, 10)), -2.0)
+
+    def test_field_scaling_and_project_defaults(self) -> None:
+        document = periodic_square(3, 3, 8.0, 3.0)
+        low = calculate_energy(document, EnergyParameters(field_mT=5))
+        high = calculate_energy(document, EnergyParameters(field_mT=10))
+        self.assertAlmostEqual(high.total_pn_nm / low.total_pn_nm, 4.0)
+        self.assertGreater(dipole_prefactor_pn_nm_um3(EnergyParameters()), 0)
+
+    def test_energy_parameters_survive_project_round_trip(self) -> None:
+        document = periodic_square(2, 2, 8.0, 3.0)
+        document.energy_parameters = EnergyParameters(
+            particle_radius_um=5, susceptibility=0.0576, field_mT=15,
+            field_angle_deg=90, cutoff_um=40,
+        ).to_dict()
+        loaded = IceDocument.from_dict(document.to_dict())
+        self.assertEqual(loaded.energy_parameters, document.energy_parameters)
 
 
 if __name__ == "__main__":

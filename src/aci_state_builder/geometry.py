@@ -29,6 +29,12 @@ def periodic_square(nx: int, ny: int, lattice_constant: float, trap_separation: 
 
 
 def periodic_vertex_charges(document: IceDocument) -> np.ndarray | None:
+    """Return q = N_in - N_out at each primary-cell vertex.
+
+    Neighbor indices wrap modulo ``nx`` and ``ny``. A spin pointing along its
+    positive axis therefore contributes -1 where it leaves and +1 where it
+    enters, including when that edge crosses a periodic seam.
+    """
     if (document.geometry != "square" or document.boundary != "periodic"
             or document.nx is None or document.ny is None
             or len(document.traps) != 2 * document.nx * document.ny):
@@ -44,3 +50,15 @@ def periodic_vertex_charges(document: IceDocument) -> np.ndarray | None:
             charge[y, x] -= vertical
             charge[(y + 1) % ny, x] += vertical
     return charge
+
+
+def periodic_vertex_data(document: IceDocument) -> list[tuple[int, int, float, float, int]]:
+    """Return ``(ix, iy, x, y, q)`` for vertices in the primary periodic cell."""
+    charges = periodic_vertex_charges(document)
+    if charges is None or document.lattice_constant is None:
+        return []
+    return [
+        (ix, iy, ix * document.lattice_constant, iy * document.lattice_constant, int(charges[iy, ix]))
+        for iy in range(document.ny or 0)
+        for ix in range(document.nx or 0)
+    ]

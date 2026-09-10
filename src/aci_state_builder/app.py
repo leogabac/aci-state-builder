@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
 )
 
 from .formats import StateFormatError, read_csv, write_csv
-from .geometry import periodic_square, periodic_vertex_charges
+from .energy import EnergyParameters, calculate_energy
+from .geometry import periodic_square, periodic_vertex_charges, periodic_vertex_data
 from .model import IceDocument
 from .presets import PRESETS
 from .validation import validate
@@ -75,6 +76,44 @@ class TrapItem(QGraphicsItem):
             self.flip_callback([self.index])
 
 
+class ChargeItem(QGraphicsItem):
+    COLORS = {
+        -4: QColor("#244b9b"),
+        -3: QColor("#3569b7"),
+        -2: QColor("#4f8bc9"),
+        -1: QColor("#88b5dc"),
+        0: QColor("#d8dee1"),
+        1: QColor("#efaaa2"),
+        2: QColor("#df7064"),
+        3: QColor("#c94a40"),
+        4: QColor("#a72f2a"),
+    }
+
+    def __init__(self, q: int, radius: float) -> None:
+        super().__init__()
+        self.q = q
+        self.radius = radius
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(5)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-self.radius, -self.radius, 2 * self.radius, 2 * self.radius)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        del option, widget
+        color = self.COLORS.get(self.q, QColor("#6b2737") if self.q > 0 else QColor("#243b6b"))
+        painter.setPen(QPen(QColor("#ffffff"), self.radius * 0.12))
+        painter.setBrush(QBrush(color))
+        painter.drawEllipse(self.boundingRect())
+        painter.setPen(QPen(QColor("#ffffff") if self.q else QColor("#53636b")))
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(max(1, round(self.radius * 0.95)))
+        painter.setFont(font)
+        label = "0" if self.q == 0 else f"{self.q:+d}"
+        painter.drawText(self.boundingRect(), Qt.AlignmentFlag.AlignCenter, label)
+
+
 class IceView(QGraphicsView):
     def __init__(self, scene: QGraphicsScene) -> None:
         super().__init__(scene)
@@ -111,6 +150,41 @@ class NewDocumentDialog(QDialog):
         return periodic_square(self.nx.value(), self.ny.value(), self.lattice.value(), self.separation.value())
 
 
+class EnergyDialog(QDialog):
+    def __init__(self, parameters: EnergyParameters, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Energy parameters")
+        form = QFormLayout(self)
+        self.radius = self._number(parameters.particle_radius_um, 0.001, 1_000_000, 6)
+        self.susceptibility = self._number(parameters.susceptibility, 0, 1_000_000, 8)
+        self.field = self._number(parameters.field_mT, 0, 1_000_000, 6)
+        self.angle = self._number(parameters.field_angle_deg, -360, 360, 3)
+        self.cutoff = self._number(parameters.cutoff_um, 0, 1_000_000, 6)
+        form.addRow("Particle radius (um)", self.radius)
+        form.addRow("Susceptibility", self.susceptibility)
+        form.addRow("Field magnitude (mT)", self.field)
+        form.addRow("Field angle from +x (deg)", self.angle)
+        form.addRow("Pair cutoff (um; 0 = all pairs)", self.cutoff)
+        note = QLabel("Uses induced dipoles aligned with the uniform in-plane field and minimum-image PBC.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); form.addRow(buttons)
+
+    @staticmethod
+    def _number(value: float, minimum: float, maximum: float, decimals: int) -> QDoubleSpinBox:
+        box = QDoubleSpinBox(); box.setRange(minimum, maximum); box.setDecimals(decimals)
+        box.setValue(value); box.setKeyboardTracking(False)
+        return box
+
+    def parameters(self) -> EnergyParameters:
+        return EnergyParameters(
+            particle_radius_um=self.radius.value(), susceptibility=self.susceptibility.value(),
+            field_mT=self.field.value(), field_angle_deg=self.angle.value(),
+            cutoff_um=self.cutoff.value(),
+        ).validated()
+
+
 class StateCommand(QUndoCommand):
     def __init__(self, window, before, after, text: str) -> None:
         super().__init__(text)
@@ -133,11 +207,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ACI State Builder"); self.resize(1180, 820)
         self.document = periodic_square(10, 10, 8.374011537, 3.0)
         self.project_path: Path | None = None
+        self.charge_mode = "Nonzero"
+        self.charge_items: list[ChargeItem] = []
         self.undo_stack = QUndoStack(self)
         self.scene = QGraphicsScene(self); self.scene.selectionChanged.connect(self.update_status)
-        self.view = IceView(self.scene); self.status = QLabel()
+        self.view = IceView(self.scene); self.status = QLabel(); self.energy_status = QLabel()
         container = QWidget(); layout = QVBoxLayout(container); layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.view); layout.addWidget(self.status); self.setCentralWidget(container)
+        layout.addWidget(self.view); layout.addWidget(self.energy_status); layout.addWidget(self.status)
+        self.setCentralWidget(container)
         self._create_actions(); self._create_toolbar(); self.rebuild_scene()
 
     def _action(self, text: str, callback, shortcut=None) -> QAction:
@@ -154,6 +231,7 @@ class MainWindow(QMainWindow):
         self.flip_action = self._action("Flip selected", self.flip_selected, QKeySequence("F"))
         self.fit_action = self._action("Fit", self.fit_scene, QKeySequence("0"))
         self.validate_action = self._action("Validate", self.show_validation)
+        self.energy_action = self._action("Energy parameters", self.edit_energy_parameters)
         self.undo_action = self.undo_stack.createUndoAction(self, "Undo")
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.redo_action = self.undo_stack.createRedoAction(self, "Redo")
@@ -167,23 +245,76 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         for name in PRESETS:
             toolbar.addAction(self._action(name, lambda checked=False, n=name: self.apply_preset(n)))
-        toolbar.addSeparator(); toolbar.addAction(self.fit_action); toolbar.addAction(self.validate_action)
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" Charges "))
+        self.charge_selector = QComboBox()
+        self.charge_selector.addItems(["Off", "Nonzero", "All"])
+        self.charge_selector.setCurrentText(self.charge_mode)
+        self.charge_selector.currentTextChanged.connect(self.set_charge_mode)
+        toolbar.addWidget(self.charge_selector)
+        toolbar.addSeparator(); toolbar.addAction(self.energy_action)
+        toolbar.addAction(self.fit_action); toolbar.addAction(self.validate_action)
 
     def rebuild_scene(self) -> None:
+        self.charge_items.clear()
         self.scene.clear()
         for index, trap in enumerate(self.document.traps):
             item = TrapItem(index, self.document, self.flip_indices)
             item.setPos(float(trap.center[0]), float(-trap.center[1]))
             item.setToolTip(f"id {trap.id} | center ({trap.center[0]:g}, {trap.center[1]:g})")
             self.scene.addItem(item)
+        self.rebuild_charge_overlay()
         margin = max(self.document.trap_separation, 1.0)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin))
-        self.fit_scene(); self.update_status()
+        self.fit_scene(); self.update_status(); self.update_energy()
 
     def refresh_items(self) -> None:
         for item in self.scene.items():
             if isinstance(item, TrapItem): item.update()
+        self.rebuild_charge_overlay()
+        self.update_status(); self.update_energy()
+
+    def rebuild_charge_overlay(self) -> None:
+        for item in self.charge_items:
+            self.scene.removeItem(item)
+        self.charge_items.clear()
+        if self.charge_mode == "Off":
+            return
+        radius = max(self.document.trap_separation * 0.40, 0.5)
+        for ix, iy, x, y, q in periodic_vertex_data(self.document):
+            if self.charge_mode == "Nonzero" and q == 0:
+                continue
+            item = ChargeItem(q, radius)
+            item.setPos(x, -y)
+            item.setToolTip(f"periodic vertex ({ix}, {iy}) | q = {q:+d} = N_in - N_out")
+            self.scene.addItem(item)
+            self.charge_items.append(item)
+
+    def set_charge_mode(self, mode: str) -> None:
+        self.charge_mode = mode
+        self.rebuild_charge_overlay()
         self.update_status()
+
+    def update_energy(self) -> None:
+        try:
+            parameters = EnergyParameters.from_mapping(self.document.energy_parameters)
+            result = calculate_energy(self.document, parameters)
+            cutoff = "all pairs" if parameters.cutoff_um == 0 else f"cutoff {parameters.cutoff_um:g} um"
+            self.energy_status.setText(
+                f"  Energy: {result.total_pn_nm:.8g} pN nm total | "
+                f"{result.per_particle_pn_nm:.8g} pN nm / colloid | "
+                f"B={parameters.field_mT:g} mT at {parameters.field_angle_deg:g} deg | "
+                f"r={parameters.particle_radius_um:g} um, chi={parameters.susceptibility:g} | "
+                f"{cutoff} | {result.elapsed_seconds * 1e3:.1f} ms"
+            )
+        except ValueError as error:
+            self.energy_status.setText(f"  Energy unavailable: {error}")
+
+    def edit_energy_parameters(self) -> None:
+        dialog = EnergyDialog(EnergyParameters.from_mapping(self.document.energy_parameters), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.document.energy_parameters = dialog.parameters().to_dict()
+            self.update_energy()
 
     def fit_scene(self) -> None:
         self.view.setTransform(QTransform())

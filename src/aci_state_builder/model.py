@@ -91,6 +91,13 @@ class IceDocument:
     units: str = "um"
     name: str = "Untitled"
     source_columns: list[str] = field(default_factory=list)
+    energy_parameters: dict[str, float] = field(default_factory=lambda: {
+        "particle_radius_um": 1.4,
+        "susceptibility": 0.4,
+        "field_mT": 10.0,
+        "field_angle_deg": 0.0,
+        "cutoff_um": 0.0,
+    })
     version: int = 1
 
     def flip_indices(self, indices: Iterable[int]) -> None:
@@ -128,6 +135,7 @@ class IceDocument:
             "units": self.units, "geometry": self.geometry, "boundary": self.boundary,
             "nx": self.nx, "ny": self.ny, "lattice_constant": self.lattice_constant,
             "trap_separation": self.trap_separation, "source_columns": self.source_columns,
+            "energy_parameters": self.energy_parameters,
             "traps": [trap.to_dict() for trap in self.traps],
         }
 

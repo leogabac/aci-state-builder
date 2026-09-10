@@ -27,7 +27,11 @@ rpy run aci-state-builder
 - Import legacy state CSVs using Polars.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
 - Save richer, versioned `.aci.json` project files.
-- Display live periodic vertex-charge counts and validate states.
+- Display periodic topological charges `q = N_in - N_out` as either nonzero-only
+  or all-vertex overlays, with modulo wrapping across both PBC seams.
+- Display live charge counts and validate states.
+- Display the PBC dipole interaction energy and energy per colloid using editable
+  radius, susceptibility, uniform field magnitude/angle, and optional pair cutoff.
 - Pan with the scrollbars, zoom with the wheel, and press `0` to fit the lattice.
 
 ## Tests
