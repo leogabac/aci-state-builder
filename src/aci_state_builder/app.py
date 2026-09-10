@@ -5,11 +5,11 @@ import sys
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QAction, QColor, QBrush, QKeySequence, QPainter, QPen, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter, QPainterPath, QPen, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel, QMainWindow,
-    QMessageBox, QSpinBox, QToolBar, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QGroupBox,
+    QLabel, QMainWindow, QMessageBox, QSpinBox, QToolBar, QVBoxLayout, QWidget,
 )
 
 from .formats import StateFormatError, read_csv, write_csv
@@ -105,13 +105,23 @@ class ChargeItem(QGraphicsItem):
         painter.setPen(QPen(QColor("#ffffff"), self.radius * 0.12))
         painter.setBrush(QBrush(color))
         painter.drawEllipse(self.boundingRect())
-        painter.setPen(QPen(QColor("#ffffff") if self.q else QColor("#53636b")))
-        font = painter.font()
+        text_color = QColor("#ffffff") if self.q else QColor("#53636b")
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(text_color))
+        font = QFont(painter.font())
         font.setBold(True)
-        font.setPixelSize(max(1, round(self.radius * 0.95)))
-        painter.setFont(font)
+        # Text rendered through QPainter's font engine can stay device-pixel
+        # sized under extreme view transforms.  Convert it into a scene-space
+        # path so the signed charge scales with its circle at every zoom.
+        font.setPointSizeF(max(self.radius * 1.15, 0.8))
         label = "0" if self.q == 0 else f"{self.q:+d}"
-        painter.drawText(self.boundingRect(), Qt.AlignmentFlag.AlignCenter, label)
+        glyph = QPainterPath()
+        glyph.addText(0, 0, font, label)
+        painter.save()
+        bounds = glyph.boundingRect()
+        painter.translate(-bounds.center())
+        painter.drawPath(glyph)
+        painter.restore()
 
 
 class IceView(QGraphicsView):
@@ -121,10 +131,77 @@ class IceView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QColor("#f7f8f4"))
+        self.field_colatitude_deg = 90.0
+        self.field_azimuth_deg = 0.0
 
     def wheelEvent(self, event) -> None:
         factor = 1.18 if event.angleDelta().y() > 0 else 1 / 1.18
         self.scale(factor, factor)
+
+    def set_field_direction(self, colatitude_deg: float, azimuth_deg: float) -> None:
+        self.field_colatitude_deg = colatitude_deg
+        self.field_azimuth_deg = azimuth_deg
+        self.viewport().update()
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        del rect
+        # Draw in viewport pixels: the cue stays in the corner while panning or zooming.
+        painter.save()
+        painter.resetTransform()
+        origin = QPointF(36, 45)
+        painter.setPen(QPen(QColor("#bd4f3c"), 1.5))
+        painter.drawLine(origin, origin + QPointF(22, 0)); painter.drawText(origin + QPointF(25, 4), "x")
+        painter.setPen(QPen(QColor("#3c8a68"), 1.5))
+        painter.drawLine(origin, origin + QPointF(0, -22)); painter.drawText(origin + QPointF(-3, -26), "y")
+        theta, phi = np.deg2rad([self.field_colatitude_deg, self.field_azimuth_deg])
+        endpoint = origin + QPointF(
+            20 * np.sin(theta) * np.cos(phi),
+            -20 * np.sin(theta) * np.sin(phi),
+        )
+        painter.setPen(QPen(QColor("#20252b"), 2.6))
+        painter.drawLine(origin, endpoint)
+        painter.setBrush(QBrush(QColor("#20252b")))
+        painter.drawEllipse(endpoint, 2.8, 2.8)
+        painter.setPen(QPen(QColor("#4d5860")))
+        painter.drawText(QPointF(12, 72), f"B, z={np.cos(theta):+.2f}")
+        painter.restore()
+
+
+class FieldDirectionPreview(QWidget):
+    """A compact, deliberately schematic x-y-z cue for the spherical field."""
+    def __init__(self, colatitude: QDoubleSpinBox, azimuth: QDoubleSpinBox, parent=None) -> None:
+        super().__init__(parent)
+        self.colatitude, self.azimuth = colatitude, azimuth
+        self.setMinimumHeight(108)
+        self.setToolTip("Field direction: theta is measured from +z and phi is measured from +x toward +y.")
+        colatitude.valueChanged.connect(self.update)
+        azimuth.valueChanged.connect(self.update)
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        origin = QPointF(58, 72)
+        x_axis, y_axis, z_axis = QPointF(34, 17), QPointF(-34, 17), QPointF(0, -43)
+        axes = ((x_axis, QColor("#bd4f3c"), "x"), (y_axis, QColor("#3c8a68"), "y"), (z_axis, QColor("#4169a8"), "z"))
+        for axis, color, label in axes:
+            endpoint = origin + axis
+            painter.setPen(QPen(color, 1.6))
+            painter.drawLine(origin, endpoint)
+            painter.drawText(endpoint + QPointF(3, 0), label)
+        theta, phi = np.deg2rad([self.colatitude.value(), self.azimuth.value()])
+        direction = (
+            x_axis * (np.sin(theta) * np.cos(phi))
+            + y_axis * (np.sin(theta) * np.sin(phi))
+            + z_axis * np.cos(theta)
+        )
+        endpoint = origin + direction
+        painter.setPen(QPen(QColor("#20252b"), 3.0))
+        painter.drawLine(origin, endpoint)
+        painter.setBrush(QBrush(QColor("#20252b")))
+        painter.drawEllipse(endpoint, 3.5, 3.5)
+        painter.setPen(QPen(QColor("#4d5860")))
+        painter.drawText(QPointF(112, 25), "field B")
 
 
 class NewDocumentDialog(QDialog):
@@ -150,26 +227,50 @@ class NewDocumentDialog(QDialog):
         return periodic_square(self.nx.value(), self.ny.value(), self.lattice.value(), self.separation.value())
 
 
-class EnergyDialog(QDialog):
-    def __init__(self, parameters: EnergyParameters, parent=None) -> None:
+class ParameterPanel(QWidget):
+    def __init__(self, parameters: EnergyParameters, change_callback, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Energy parameters")
-        form = QFormLayout(self)
+        self.change_callback = change_callback
+        self._loading = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        particles = QGroupBox("Particles")
+        particle_form = QFormLayout(particles)
         self.radius = self._number(parameters.particle_radius_um, 0.001, 1_000_000, 6)
         self.susceptibility = self._number(parameters.susceptibility, 0, 1_000_000, 8)
+        particle_form.addRow("Radius (um)", self.radius)
+        particle_form.addRow("Susceptibility", self.susceptibility)
+        layout.addWidget(particles)
+
+        field_group = QGroupBox("Uniform field (spherical)")
+        field_form = QFormLayout(field_group)
         self.field = self._number(parameters.field_mT, 0, 1_000_000, 6)
-        self.angle = self._number(parameters.field_angle_deg, -360, 360, 3)
+        self.colatitude = self._number(parameters.field_colatitude_deg, 0, 180, 3)
+        self.azimuth = self._number(parameters.field_azimuth_deg, -360, 360, 3)
+        field_form.addRow("Magnitude B (mT)", self.field)
+        field_form.addRow("Co-latitude theta (deg)", self.colatitude)
+        field_form.addRow("Azimuth phi (deg)", self.azimuth)
+        field_form.addRow(FieldDirectionPreview(self.colatitude, self.azimuth, self))
+        convention = QLabel("theta: from +z   |   phi: +x toward +y")
+        convention.setStyleSheet("color: #59656b;")
+        field_form.addRow(convention)
+        layout.addWidget(field_group)
+
+        calculation = QGroupBox("Interaction energy")
+        calculation_form = QFormLayout(calculation)
         self.cutoff = self._number(parameters.cutoff_um, 0, 1_000_000, 6)
-        form.addRow("Particle radius (um)", self.radius)
-        form.addRow("Susceptibility", self.susceptibility)
-        form.addRow("Field magnitude (mT)", self.field)
-        form.addRow("Field angle from +x (deg)", self.angle)
-        form.addRow("Pair cutoff (um; 0 = all pairs)", self.cutoff)
-        note = QLabel("Uses induced dipoles aligned with the uniform in-plane field and minimum-image PBC.")
-        note.setWordWrap(True)
-        form.addRow(note)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); form.addRow(buttons)
+        self.energy_result = QLabel()
+        self.energy_result.setWordWrap(True)
+        self.energy_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        calculation_form.addRow("Cutoff (um; 0 = all)", self.cutoff)
+        calculation_form.addRow(self.energy_result)
+        layout.addWidget(calculation)
+        layout.addStretch(1)
+
+        for box in (self.radius, self.susceptibility, self.field,
+                    self.colatitude, self.azimuth, self.cutoff):
+            box.valueChanged.connect(self._parameters_changed)
 
     @staticmethod
     def _number(value: float, minimum: float, maximum: float, decimals: int) -> QDoubleSpinBox:
@@ -180,9 +281,28 @@ class EnergyDialog(QDialog):
     def parameters(self) -> EnergyParameters:
         return EnergyParameters(
             particle_radius_um=self.radius.value(), susceptibility=self.susceptibility.value(),
-            field_mT=self.field.value(), field_angle_deg=self.angle.value(),
+            field_mT=self.field.value(), field_colatitude_deg=self.colatitude.value(),
+            field_azimuth_deg=self.azimuth.value(),
             cutoff_um=self.cutoff.value(),
         ).validated()
+
+    def set_parameters(self, parameters: EnergyParameters) -> None:
+        self._loading = True
+        values = (
+            (self.radius, parameters.particle_radius_um),
+            (self.susceptibility, parameters.susceptibility),
+            (self.field, parameters.field_mT),
+            (self.colatitude, parameters.field_colatitude_deg),
+            (self.azimuth, parameters.field_azimuth_deg),
+            (self.cutoff, parameters.cutoff_um),
+        )
+        for box, value in values:
+            box.setValue(value)
+        self._loading = False
+
+    def _parameters_changed(self) -> None:
+        if not self._loading:
+            self.change_callback(self.parameters())
 
 
 class StateCommand(QUndoCommand):
@@ -211,11 +331,11 @@ class MainWindow(QMainWindow):
         self.charge_items: list[ChargeItem] = []
         self.undo_stack = QUndoStack(self)
         self.scene = QGraphicsScene(self); self.scene.selectionChanged.connect(self.update_status)
-        self.view = IceView(self.scene); self.status = QLabel(); self.energy_status = QLabel()
+        self.view = IceView(self.scene); self.status = QLabel()
         container = QWidget(); layout = QVBoxLayout(container); layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.view); layout.addWidget(self.energy_status); layout.addWidget(self.status)
+        layout.addWidget(self.view); layout.addWidget(self.status)
         self.setCentralWidget(container)
-        self._create_actions(); self._create_toolbar(); self.rebuild_scene()
+        self._create_actions(); self._create_toolbar(); self._create_parameter_dock(); self.rebuild_scene()
 
     def _action(self, text: str, callback, shortcut=None) -> QAction:
         action = QAction(text, self); action.triggered.connect(callback)
@@ -231,7 +351,6 @@ class MainWindow(QMainWindow):
         self.flip_action = self._action("Flip selected", self.flip_selected, QKeySequence("F"))
         self.fit_action = self._action("Fit", self.fit_scene, QKeySequence("0"))
         self.validate_action = self._action("Validate", self.show_validation)
-        self.energy_action = self._action("Energy parameters", self.edit_energy_parameters)
         self.undo_action = self.undo_stack.createUndoAction(self, "Undo")
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.redo_action = self.undo_stack.createRedoAction(self, "Redo")
@@ -252,8 +371,18 @@ class MainWindow(QMainWindow):
         self.charge_selector.setCurrentText(self.charge_mode)
         self.charge_selector.currentTextChanged.connect(self.set_charge_mode)
         toolbar.addWidget(self.charge_selector)
-        toolbar.addSeparator(); toolbar.addAction(self.energy_action)
-        toolbar.addAction(self.fit_action); toolbar.addAction(self.validate_action)
+        toolbar.addSeparator(); toolbar.addAction(self.fit_action); toolbar.addAction(self.validate_action)
+
+    def _create_parameter_dock(self) -> None:
+        parameters = EnergyParameters.from_mapping(self.document.energy_parameters)
+        self.parameter_panel = ParameterPanel(parameters, self.set_energy_parameters, self)
+        dock = QDockWidget("Physical parameters", self)
+        dock.setObjectName("physical-parameters")
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        dock.setMinimumWidth(300)
+        dock.setWidget(self.parameter_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     def rebuild_scene(self) -> None:
         self.charge_items.clear()
@@ -266,6 +395,7 @@ class MainWindow(QMainWindow):
         self.rebuild_charge_overlay()
         margin = max(self.document.trap_separation, 1.0)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin))
+        self.parameter_panel.set_parameters(EnergyParameters.from_mapping(self.document.energy_parameters))
         self.fit_scene(); self.update_status(); self.update_energy()
 
     def refresh_items(self) -> None:
@@ -298,23 +428,20 @@ class MainWindow(QMainWindow):
     def update_energy(self) -> None:
         try:
             parameters = EnergyParameters.from_mapping(self.document.energy_parameters)
+            self.view.set_field_direction(parameters.field_colatitude_deg, parameters.field_azimuth_deg)
             result = calculate_energy(self.document, parameters)
             cutoff = "all pairs" if parameters.cutoff_um == 0 else f"cutoff {parameters.cutoff_um:g} um"
-            self.energy_status.setText(
-                f"  Energy: {result.total_pn_nm:.8g} pN nm total | "
-                f"{result.per_particle_pn_nm:.8g} pN nm / colloid | "
-                f"B={parameters.field_mT:g} mT at {parameters.field_angle_deg:g} deg | "
-                f"r={parameters.particle_radius_um:g} um, chi={parameters.susceptibility:g} | "
-                f"{cutoff} | {result.elapsed_seconds * 1e3:.1f} ms"
+            self.parameter_panel.energy_result.setText(
+                f"<b>{result.total_pn_nm:.8g} pN nm</b> total<br>"
+                f"{result.per_particle_pn_nm:.8g} pN nm / colloid<br>"
+                f"{cutoff} &nbsp;|&nbsp; {result.elapsed_seconds * 1e3:.1f} ms"
             )
         except ValueError as error:
-            self.energy_status.setText(f"  Energy unavailable: {error}")
+            self.parameter_panel.energy_result.setText(f"Energy unavailable: {error}")
 
-    def edit_energy_parameters(self) -> None:
-        dialog = EnergyDialog(EnergyParameters.from_mapping(self.document.energy_parameters), self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.document.energy_parameters = dialog.parameters().to_dict()
-            self.update_energy()
+    def set_energy_parameters(self, parameters: EnergyParameters) -> None:
+        self.document.energy_parameters = parameters.to_dict()
+        self.update_energy()
 
     def fit_scene(self) -> None:
         self.view.setTransform(QTransform())

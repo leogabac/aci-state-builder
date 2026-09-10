@@ -19,13 +19,14 @@ class EnergyParameters:
     particle_radius_um: float = 1.4
     susceptibility: float = 0.4
     field_mT: float = 10.0
-    field_angle_deg: float = 0.0
+    field_colatitude_deg: float = 90.0
+    field_azimuth_deg: float = 0.0
     cutoff_um: float = 0.0
 
     def validated(self) -> EnergyParameters:
         values = np.asarray([
             self.particle_radius_um, self.susceptibility, self.field_mT,
-            self.field_angle_deg, self.cutoff_um,
+            self.field_colatitude_deg, self.field_azimuth_deg, self.cutoff_um,
         ])
         if not np.all(np.isfinite(values)):
             raise ValueError("energy parameters must be finite")
@@ -33,6 +34,8 @@ class EnergyParameters:
             raise ValueError("particle radius must be positive")
         if self.susceptibility < 0 or self.field_mT < 0 or self.cutoff_um < 0:
             raise ValueError("susceptibility, field, and cutoff cannot be negative")
+        if not 0 <= self.field_colatitude_deg <= 180:
+            raise ValueError("field co-latitude must be between 0 and 180 degrees")
         return self
 
     def to_dict(self) -> dict[str, float]:
@@ -40,7 +43,8 @@ class EnergyParameters:
             "particle_radius_um": self.particle_radius_um,
             "susceptibility": self.susceptibility,
             "field_mT": self.field_mT,
-            "field_angle_deg": self.field_angle_deg,
+            "field_colatitude_deg": self.field_colatitude_deg,
+            "field_azimuth_deg": self.field_azimuth_deg,
             "cutoff_um": self.cutoff_um,
         }
 
@@ -48,6 +52,12 @@ class EnergyParameters:
     def from_mapping(cls, values: Mapping[str, float] | None) -> EnergyParameters:
         if not values:
             return cls()
+        # Projects written before spherical field controls stored an in-plane
+        # angle from +x.  Preserve that physical direction on load.
+        if "field_angle_deg" in values and "field_azimuth_deg" not in values:
+            values = dict(values)
+            values["field_colatitude_deg"] = 90.0
+            values["field_azimuth_deg"] = values["field_angle_deg"]
         known = {name: float(values[name]) for name in cls.__dataclass_fields__ if name in values}
         return cls(**known).validated()
 
@@ -85,11 +95,12 @@ def colloid_positions(document: IceDocument) -> np.ndarray:
 def geometric_dipole_sum_pbc(
     positions_um: np.ndarray,
     box_um: tuple[float, float],
-    field_angle_deg: float = 0.0,
+    field_colatitude_deg: float = 90.0,
+    field_azimuth_deg: float = 0.0,
     cutoff_um: float = 0.0,
     block_size: int = 256,
 ) -> float:
-    """Compute sum[(1-3(Bhat.rhat)^2)/r^3] using 2D minimum-image PBC."""
+    """Compute the dipole sum for a spherical field direction with 2D PBC."""
     positions = np.asarray(positions_um, dtype=float)
     if positions.ndim != 2 or positions.shape[1] != 3:
         raise ValueError("positions must have shape (n, 3)")
@@ -98,8 +109,13 @@ def geometric_dipole_sum_pbc(
     box = np.asarray(box_um, dtype=float)
     if box.shape != (2,) or np.any(~np.isfinite(box)) or np.any(box <= 0):
         raise ValueError("PBC box lengths must be positive and finite")
-    angle = np.deg2rad(field_angle_deg)
-    field_hat = np.asarray([np.cos(angle), np.sin(angle), 0.0])
+    theta = np.deg2rad(field_colatitude_deg)
+    phi = np.deg2rad(field_azimuth_deg)
+    field_hat = np.asarray([
+        np.sin(theta) * np.cos(phi),
+        np.sin(theta) * np.sin(phi),
+        np.cos(theta),
+    ])
     cutoff2 = cutoff_um**2
     total = 0.0
 
@@ -130,7 +146,8 @@ def calculate_energy(document: IceDocument, parameters: EnergyParameters) -> Ene
     geometric_sum = geometric_dipole_sum_pbc(
         positions,
         (document.nx * document.lattice_constant, document.ny * document.lattice_constant),
-        parameters.field_angle_deg,
+        parameters.field_colatitude_deg,
+        parameters.field_azimuth_deg,
         parameters.cutoff_um,
     )
     total = dipole_prefactor_pn_nm_um3(parameters) * geometric_sum

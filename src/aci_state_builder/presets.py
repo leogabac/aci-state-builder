@@ -17,24 +17,17 @@ def ferromagnetic(document: IceDocument) -> np.ndarray:
     return np.ones(len(document.traps), dtype=np.int8)
 
 
-def af2(document: IceDocument) -> np.ndarray:
+def af4(document: IceDocument) -> np.ndarray:
+    """Return the AF4 ground state of a generated periodic square lattice."""
     nx, ny = _shape(document)
     values = np.ones(len(document.traps), dtype=np.int8)
     offset = nx * ny
     for y in range(ny):
         for x in range(nx):
-            # This is equivalent to the three historical flip lists, including duplicates.
             if (x % 2 == 1) != (y % 2 == 0):
                 values[y * nx + x] = -1
             if x % 2 == 0:
                 values[offset + y * nx + x] = -1
-    return values
-
-
-def af4(document: IceDocument) -> np.ndarray:
-    nx, ny = _shape(document)
-    values = af2(document)
-    offset = nx * ny
     for y in range(1, ny, 2):
         values[offset + y * nx: offset + (y + 1) * nx] *= -1
     return values
@@ -47,4 +40,4 @@ def ice(document: IceDocument) -> np.ndarray:
     return values
 
 
-PRESETS = {"Ferromagnetic": ferromagnetic, "AF2": af2, "AF4": af4, "Ice": ice}
+PRESETS = {"Ferromagnetic": ferromagnetic, "AF4 ground state": af4, "Ice": ice}

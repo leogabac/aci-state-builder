@@ -22,7 +22,7 @@ rpy run aci-state-builder
 - Generate rectangular periodic square lattices.
 - Click a trap to flip its colloid; Shift/Ctrl-click selects without flipping.
 - Rubber-band select traps and press `F` to flip the selection.
-- Apply ferromagnetic, AF2, AF4, and ice presets.
+- Apply ferromagnetic, the square-lattice AF4 ground-state, and ice presets.
 - Undo and redo state changes.
 - Import legacy state CSVs using Polars.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
@@ -30,8 +30,9 @@ rpy run aci-state-builder
 - Display periodic topological charges `q = N_in - N_out` as either nonzero-only
   or all-vertex overlays, with modulo wrapping across both PBC seams.
 - Display live charge counts and validate states.
-- Display the PBC dipole interaction energy and energy per colloid using editable
-  radius, susceptibility, uniform field magnitude/angle, and optional pair cutoff.
+- Use a persistent right-hand physical-parameter pane for the radius,
+  susceptibility, uniform field spherical coordinates (magnitude, co-latitude
+  from +z, and x-y azimuth), optional pair cutoff, and live interaction energy.
 - Pan with the scrollbars, zoom with the wheel, and press `0` to fit the lattice.
 
 ## Tests
@@ -40,4 +41,4 @@ rpy run aci-state-builder
 PYTHONPATH=src rpy run python -m unittest discover -s tests -v
 ```
 
-Compatibility tests read the surviving AF2 and AF4 fixtures from the adjacent `stuckgs` checkout when it is present.
+Compatibility tests read the surviving AF4 fixture from the adjacent `stuckgs` checkout when it is present.

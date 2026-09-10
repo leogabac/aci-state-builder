@@ -95,7 +95,8 @@ class IceDocument:
         "particle_radius_um": 1.4,
         "susceptibility": 0.4,
         "field_mT": 10.0,
-        "field_angle_deg": 0.0,
+        "field_colatitude_deg": 90.0,
+        "field_azimuth_deg": 0.0,
         "cutoff_um": 0.0,
     })
     version: int = 1
@@ -146,6 +147,15 @@ class IceDocument:
         fields = dict(data)
         fields.pop("format")
         fields["traps"] = [TrapState.from_dict(item) for item in fields["traps"]]
+        parameters = fields.get("energy_parameters")
+        if isinstance(parameters, dict) and "field_angle_deg" in parameters:
+            # Old projects used one in-plane angle from +x.  Rewrite it into
+            # the equivalent spherical direction when the project is loaded.
+            parameters = dict(parameters)
+            parameters.setdefault("field_colatitude_deg", 90.0)
+            parameters.setdefault("field_azimuth_deg", parameters["field_angle_deg"])
+            parameters.pop("field_angle_deg")
+            fields["energy_parameters"] = parameters
         return cls(**fields)
 
     def save(self, path: str | Path) -> None:

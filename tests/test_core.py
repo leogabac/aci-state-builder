@@ -11,7 +11,7 @@ from aci_state_builder.energy import (
 )
 from aci_state_builder.geometry import periodic_square, periodic_vertex_charges
 from aci_state_builder.model import IceDocument
-from aci_state_builder.presets import af2, af4
+from aci_state_builder.presets import PRESETS, af4
 from aci_state_builder.validation import validate
 
 
@@ -27,14 +27,13 @@ class GeometryTests(unittest.TestCase):
         np.testing.assert_allclose(document.traps[4].center, [0, 4, 0])
         np.testing.assert_allclose(document.traps[7].center, [8, 12, 0])
 
-    def test_historical_preset_charge_patterns(self) -> None:
+    def test_af4_ground_state_charge_pattern(self) -> None:
         document = periodic_square(10, 10, 8.374011537, 3.0)
-        document.set_occupancies(af2(document))
-        values, counts = np.unique(periodic_vertex_charges(document), return_counts=True)
-        self.assertEqual(dict(zip(values.tolist(), counts.tolist(), strict=True)), {-2: 50, 2: 50})
         document.set_occupancies(af4(document))
         values, counts = np.unique(periodic_vertex_charges(document), return_counts=True)
         self.assertEqual(dict(zip(values.tolist(), counts.tolist(), strict=True)), {-4: 50, 4: 50})
+        self.assertNotIn("AF2", PRESETS)
+        self.assertIn("AF4 ground state", PRESETS)
 
     def test_snapshot_preserves_imported_displacement(self) -> None:
         document = periodic_square(2, 2, 8.0, 3.0)
@@ -59,7 +58,7 @@ class GeometryTests(unittest.TestCase):
 class FormatTests(unittest.TestCase):
     def test_canonical_csv_round_trip(self) -> None:
         source = periodic_square(3, 3, 8.0, 3.0)
-        source.set_occupancies(af2(source))
+        source.set_occupancies(af4(source))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.csv"
             write_csv(source, path)
@@ -88,13 +87,6 @@ class FormatTests(unittest.TestCase):
             loaded = IceDocument.load(path)
         self.assertEqual(loaded.to_dict(), source.to_dict())
 
-    def test_surviving_af2_fixture(self) -> None:
-        fixture = WORKSPACE / "stuckgs/data/configurations/af2/10.csv"
-        if not fixture.exists(): self.skipTest("stuckgs fixture is not mounted")
-        loaded = read_csv(fixture)
-        expected = periodic_square(10, 10, loaded.lattice_constant, loaded.trap_separation)
-        np.testing.assert_array_equal(loaded.occupancies(), af2(expected))
-
     def test_surviving_af4_fixture(self) -> None:
         fixture = WORKSPACE / "stuckgs/data/configurations/af4/10.csv"
         if not fixture.exists(): self.skipTest("stuckgs fixture is not mounted")
@@ -108,6 +100,8 @@ class EnergyTests(unittest.TestCase):
         positions = np.array([[0.5, 0, 0], [9.5, 0, 0]])
         # They are one micrometre apart through the periodic x seam and parallel to B.
         self.assertAlmostEqual(geometric_dipole_sum_pbc(positions, (10, 10)), -2.0)
+        # At theta=0 the field is perpendicular to the x-y lattice plane.
+        self.assertAlmostEqual(geometric_dipole_sum_pbc(positions, (10, 10), 0), 1.0)
 
     def test_field_scaling_and_project_defaults(self) -> None:
         document = periodic_square(3, 3, 8.0, 3.0)
@@ -120,10 +114,23 @@ class EnergyTests(unittest.TestCase):
         document = periodic_square(2, 2, 8.0, 3.0)
         document.energy_parameters = EnergyParameters(
             particle_radius_um=5, susceptibility=0.0576, field_mT=15,
-            field_angle_deg=90, cutoff_um=40,
+            field_colatitude_deg=90, field_azimuth_deg=90, cutoff_um=40,
         ).to_dict()
         loaded = IceDocument.from_dict(document.to_dict())
         self.assertEqual(loaded.energy_parameters, document.energy_parameters)
+
+    def test_legacy_in_plane_angle_loads_as_spherical_coordinates(self) -> None:
+        parameters = EnergyParameters.from_mapping({"field_angle_deg": 37})
+        self.assertEqual(parameters.field_colatitude_deg, 90)
+        self.assertEqual(parameters.field_azimuth_deg, 37)
+
+        document = periodic_square(2, 2, 8.0, 3.0)
+        payload = document.to_dict()
+        payload["energy_parameters"] = {"field_angle_deg": 37}
+        loaded = IceDocument.from_dict(payload)
+        self.assertEqual(loaded.energy_parameters, {
+            "field_colatitude_deg": 90.0, "field_azimuth_deg": 37,
+        })
 
 
 if __name__ == "__main__":
