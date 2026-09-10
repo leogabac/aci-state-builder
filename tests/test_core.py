@@ -80,12 +80,16 @@ class FormatTests(unittest.TestCase):
 
     def test_project_json_round_trip(self) -> None:
         source = periodic_square(2, 3, 7.5, 2.5)
+        source.trap_height_pn_nm = 9.5
+        source.trap_stiffness_pn_per_nm = 0.125
         source.set_occupancies(af4(source))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.aci.json"
             source.save(path)
             loaded = IceDocument.load(path)
         self.assertEqual(loaded.to_dict(), source.to_dict())
+        self.assertEqual(loaded.trap_height_pn_nm, 9.5)
+        self.assertEqual(loaded.trap_stiffness_pn_per_nm, 0.125)
 
     def test_surviving_af4_fixture(self) -> None:
         fixture = WORKSPACE / "stuckgs/data/configurations/af4/10.csv"

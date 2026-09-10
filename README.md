@@ -30,9 +30,9 @@ rpy run aci-state-builder
 - Display periodic topological charges `q = N_in - N_out` as either nonzero-only
   or all-vertex overlays, with modulo wrapping across both PBC seams.
 - Display live charge counts and validate states.
-- Use a persistent right-hand physical-parameter pane for the radius,
-  susceptibility, uniform field spherical coordinates (magnitude, co-latitude
-  from +z, and x-y azimuth), optional pair cutoff, and live interaction energy.
+- Use a persistent right-hand parameter pane for lattice dimensions and spacing,
+  trap separation/height/stiffness, particle properties, uniform-field spherical
+  coordinates, optional pair cutoff, and live interaction energy.
 - Pan with the scrollbars, zoom with the wheel, and press `0` to fit the lattice.
 
 ## Tests

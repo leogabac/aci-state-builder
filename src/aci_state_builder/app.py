@@ -9,7 +9,8 @@ from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QGroupBox,
-    QLabel, QMainWindow, QMessageBox, QSpinBox, QToolBar, QVBoxLayout, QWidget,
+    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QToolBar,
+    QVBoxLayout, QWidget,
 )
 
 from .formats import StateFormatError, read_csv, write_csv
@@ -216,25 +217,61 @@ class NewDocumentDialog(QDialog):
         self.separation = QDoubleSpinBox(); self.separation.setRange(0.001, 1_000_000)
         self.separation.setDecimals(6)
         self.separation.setValue(3.0)
+        self.trap_height = QDoubleSpinBox(); self.trap_height.setRange(0, 1_000_000)
+        self.trap_height.setDecimals(6); self.trap_height.setValue(8.0)
+        self.trap_stiffness = QDoubleSpinBox(); self.trap_stiffness.setRange(0, 1_000_000)
+        self.trap_stiffness.setDecimals(6); self.trap_stiffness.setValue(0.1)
         self.boundary = QComboBox(); self.boundary.addItem("Periodic")
         form.addRow("Horizontal cells", self.nx); form.addRow("Vertical cells", self.ny)
         form.addRow("Lattice constant (um)", self.lattice)
-        form.addRow("Trap separation (um)", self.separation); form.addRow("Boundary", self.boundary)
+        form.addRow("Trap separation (um)", self.separation)
+        form.addRow("Trap height (pN nm)", self.trap_height)
+        form.addRow("Trap stiffness (pN/nm)", self.trap_stiffness)
+        form.addRow("Boundary", self.boundary)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); form.addRow(buttons)
 
     def create_document(self) -> IceDocument:
-        return periodic_square(self.nx.value(), self.ny.value(), self.lattice.value(), self.separation.value())
+        document = periodic_square(self.nx.value(), self.ny.value(), self.lattice.value(), self.separation.value())
+        document.trap_height_pn_nm = self.trap_height.value()
+        document.trap_stiffness_pn_per_nm = self.trap_stiffness.value()
+        return document
 
 
 class ParameterPanel(QWidget):
-    def __init__(self, parameters: EnergyParameters, change_callback, parent=None) -> None:
+    def __init__(self, document: IceDocument, change_callback, lattice_callback, parent=None) -> None:
         super().__init__(parent)
         self.change_callback = change_callback
+        self.lattice_callback = lattice_callback
         self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        lattice = QGroupBox("Lattice")
+        lattice_form = QFormLayout(lattice)
+        self.nx = QSpinBox(); self.nx.setRange(1, 200)
+        self.ny = QSpinBox(); self.ny.setRange(1, 200)
+        self.lattice_constant = self._number(8.374011537, 0.001, 1_000_000, 6)
+        self.box_size = QLabel()
+        self.apply_lattice = QPushButton("Apply lattice")
+        lattice_form.addRow("Cells Nx", self.nx)
+        lattice_form.addRow("Cells Ny", self.ny)
+        lattice_form.addRow("Constant a (um)", self.lattice_constant)
+        lattice_form.addRow("Box Lx x Ly", self.box_size)
+        lattice_form.addRow(self.apply_lattice)
+        layout.addWidget(lattice)
+
+        traps = QGroupBox("Traps")
+        trap_form = QFormLayout(traps)
+        self.trap_separation = self._number(3.0, 0.001, 1_000_000, 6)
+        self.trap_height = self._number(8.0, 0, 1_000_000, 6)
+        self.trap_stiffness = self._number(0.1, 0, 1_000_000, 6)
+        trap_form.addRow("Separation (um)", self.trap_separation)
+        trap_form.addRow("Height (pN nm)", self.trap_height)
+        trap_form.addRow("Stiffness (pN/nm)", self.trap_stiffness)
+        layout.addWidget(traps)
+
+        parameters = EnergyParameters.from_mapping(document.energy_parameters)
         particles = QGroupBox("Particles")
         particle_form = QFormLayout(particles)
         self.radius = self._number(parameters.particle_radius_um, 0.001, 1_000_000, 6)
@@ -271,6 +308,10 @@ class ParameterPanel(QWidget):
         for box in (self.radius, self.susceptibility, self.field,
                     self.colatitude, self.azimuth, self.cutoff):
             box.valueChanged.connect(self._parameters_changed)
+        for box in (self.nx, self.ny, self.lattice_constant):
+            box.valueChanged.connect(self._update_box_size)
+        self.apply_lattice.clicked.connect(self._apply_lattice)
+        self.set_document(document)
 
     @staticmethod
     def _number(value: float, minimum: float, maximum: float, decimals: int) -> QDoubleSpinBox:
@@ -282,13 +323,18 @@ class ParameterPanel(QWidget):
         return EnergyParameters(
             particle_radius_um=self.radius.value(), susceptibility=self.susceptibility.value(),
             field_mT=self.field.value(), field_colatitude_deg=self.colatitude.value(),
-            field_azimuth_deg=self.azimuth.value(),
-            cutoff_um=self.cutoff.value(),
+            field_azimuth_deg=self.azimuth.value(), cutoff_um=self.cutoff.value(),
         ).validated()
 
-    def set_parameters(self, parameters: EnergyParameters) -> None:
+    def set_document(self, document: IceDocument) -> None:
+        parameters = EnergyParameters.from_mapping(document.energy_parameters)
         self._loading = True
         values = (
+            (self.nx, document.nx or 1), (self.ny, document.ny or 1),
+            (self.lattice_constant, document.lattice_constant or 1.0),
+            (self.trap_separation, document.trap_separation),
+            (self.trap_height, document.trap_height_pn_nm),
+            (self.trap_stiffness, document.trap_stiffness_pn_per_nm),
             (self.radius, parameters.particle_radius_um),
             (self.susceptibility, parameters.susceptibility),
             (self.field, parameters.field_mT),
@@ -298,7 +344,22 @@ class ParameterPanel(QWidget):
         )
         for box, value in values:
             box.setValue(value)
+        generated_square = document.geometry == "square" and document.nx is not None and document.ny is not None
+        self.apply_lattice.setEnabled(generated_square)
         self._loading = False
+        self._update_box_size()
+
+    def _update_box_size(self) -> None:
+        self.box_size.setText(
+            f"{self.nx.value() * self.lattice_constant.value():g} x "
+            f"{self.ny.value() * self.lattice_constant.value():g} um"
+        )
+
+    def _apply_lattice(self) -> None:
+        self.lattice_callback(
+            self.nx.value(), self.ny.value(), self.lattice_constant.value(),
+            self.trap_separation.value(), self.trap_height.value(), self.trap_stiffness.value(),
+        )
 
     def _parameters_changed(self) -> None:
         if not self._loading:
@@ -374,14 +435,18 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator(); toolbar.addAction(self.fit_action); toolbar.addAction(self.validate_action)
 
     def _create_parameter_dock(self) -> None:
-        parameters = EnergyParameters.from_mapping(self.document.energy_parameters)
-        self.parameter_panel = ParameterPanel(parameters, self.set_energy_parameters, self)
+        self.parameter_panel = ParameterPanel(
+            self.document, self.set_energy_parameters, self.apply_lattice_parameters, self,
+        )
         dock = QDockWidget("Physical parameters", self)
         dock.setObjectName("physical-parameters")
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
         dock.setMinimumWidth(300)
-        dock.setWidget(self.parameter_panel)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.parameter_panel)
+        dock.setWidget(scroll)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     def rebuild_scene(self) -> None:
@@ -395,7 +460,7 @@ class MainWindow(QMainWindow):
         self.rebuild_charge_overlay()
         margin = max(self.document.trap_separation, 1.0)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin))
-        self.parameter_panel.set_parameters(EnergyParameters.from_mapping(self.document.energy_parameters))
+        self.parameter_panel.set_document(self.document)
         self.fit_scene(); self.update_status(); self.update_energy()
 
     def refresh_items(self) -> None:
@@ -442,6 +507,35 @@ class MainWindow(QMainWindow):
     def set_energy_parameters(self, parameters: EnergyParameters) -> None:
         self.document.energy_parameters = parameters.to_dict()
         self.update_energy()
+
+    def apply_lattice_parameters(
+        self, nx: int, ny: int, lattice_constant: float, trap_separation: float,
+        trap_height: float, trap_stiffness: float,
+    ) -> None:
+        same_shape = (nx, ny) == (self.document.nx, self.document.ny)
+        if not same_shape:
+            answer = QMessageBox.question(
+                self, "Rebuild lattice",
+                "Changing the system size creates a new lattice state. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.parameter_panel.set_document(self.document)
+                return
+
+        replacement = periodic_square(nx, ny, lattice_constant, trap_separation)
+        replacement.name = self.document.name
+        replacement.energy_parameters = dict(self.document.energy_parameters)
+        replacement.trap_height_pn_nm = trap_height
+        replacement.trap_stiffness_pn_per_nm = trap_stiffness
+        if same_shape:
+            replacement.source_columns = list(self.document.source_columns)
+            for old, new in zip(self.document.traps, replacement.traps, strict=True):
+                new.occupancy = old.occupancy
+                new.direction_scale = old.direction_scale
+                new.displacement = None if old.displacement is None else old.displacement.copy()
+                new.extras = dict(old.extras)
+        self.set_document(replacement, self.project_path)
 
     def fit_scene(self) -> None:
         self.view.setTransform(QTransform())

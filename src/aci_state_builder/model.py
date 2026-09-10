@@ -88,6 +88,8 @@ class IceDocument:
     ny: int | None = None
     lattice_constant: float | None = None
     trap_separation: float = 3.0
+    trap_height_pn_nm: float = 8.0
+    trap_stiffness_pn_per_nm: float = 0.1
     units: str = "um"
     name: str = "Untitled"
     source_columns: list[str] = field(default_factory=list)
@@ -135,7 +137,10 @@ class IceDocument:
             "format": "aci-state-builder", "version": self.version, "name": self.name,
             "units": self.units, "geometry": self.geometry, "boundary": self.boundary,
             "nx": self.nx, "ny": self.ny, "lattice_constant": self.lattice_constant,
-            "trap_separation": self.trap_separation, "source_columns": self.source_columns,
+            "trap_separation": self.trap_separation,
+            "trap_height_pn_nm": self.trap_height_pn_nm,
+            "trap_stiffness_pn_per_nm": self.trap_stiffness_pn_per_nm,
+            "source_columns": self.source_columns,
             "energy_parameters": self.energy_parameters,
             "traps": [trap.to_dict() for trap in self.traps],
         }
