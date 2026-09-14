@@ -22,7 +22,8 @@ rpy run aci-state-builder
 - Generate rectangular periodic square lattices.
 - Click a trap to flip its colloid; Shift/Ctrl-click selects without flipping.
 - Rubber-band select traps and press `F` to flip the selection.
-- Apply ferromagnetic, the square-lattice AF4 ground-state, and ice presets.
+- Apply square-lattice polarized, 2-in/2-out, and 4-in/4-out configurations,
+  or randomize all trap occupancies, from the context-aware sidebar.
 - Undo and redo state changes.
 - Import legacy state CSVs using Polars.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
