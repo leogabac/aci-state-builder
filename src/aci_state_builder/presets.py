@@ -13,13 +13,20 @@ def _shape(document: IceDocument) -> tuple[int, int]:
     return document.nx, document.ny
 
 
-def ferromagnetic(document: IceDocument) -> np.ndarray:
+def _even_shape(document: IceDocument) -> tuple[int, int]:
+    nx, ny = _shape(document)
+    if nx % 2 or ny % 2:
+        raise ValueError("this periodic pattern requires even Nx and Ny")
+    return nx, ny
+
+
+def polarized(document: IceDocument) -> np.ndarray:
     return np.ones(len(document.traps), dtype=np.int8)
 
 
-def af4(document: IceDocument) -> np.ndarray:
-    """Return the AF4 ground state of a generated periodic square lattice."""
-    nx, ny = _shape(document)
+def four_in_four_out(document: IceDocument) -> np.ndarray:
+    """Return the alternating charged-vertex pattern of square ice."""
+    nx, ny = _even_shape(document)
     values = np.ones(len(document.traps), dtype=np.int8)
     offset = nx * ny
     for y in range(ny):
@@ -33,11 +40,23 @@ def af4(document: IceDocument) -> np.ndarray:
     return values
 
 
-def ice(document: IceDocument) -> np.ndarray:
-    nx, ny = _shape(document)
-    values = af4(document)
+def two_in_two_out(document: IceDocument) -> np.ndarray:
+    """Return a charge-neutral two-in/two-out pattern of square ice."""
+    nx, ny = _even_shape(document)
+    values = four_in_four_out(document)
     values[nx * ny:] *= -1
     return values
 
 
-PRESETS = {"Ferromagnetic": ferromagnetic, "AF4 ground state": af4, "Ice": ice}
+def randomized(document: IceDocument, rng: np.random.Generator | None = None) -> np.ndarray:
+    """Draw independent, equiprobable Ising occupancies for every trap."""
+    generator = np.random.default_rng() if rng is None else rng
+    return generator.choice((-1, 1), size=len(document.traps)).astype(np.int8)
+
+
+SQUARE_CONFIGURATIONS = {
+    "Polarized": polarized,
+    "2-in / 2-out": two_in_two_out,
+    "4-in / 4-out": four_in_four_out,
+    "Randomize": randomized,
+}

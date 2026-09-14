@@ -8,16 +8,16 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter, QPainterPath, QPen, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QGroupBox,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QToolBar,
-    QVBoxLayout, QWidget,
+    QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+    QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .formats import StateFormatError, read_csv, write_csv
 from .energy import EnergyParameters, calculate_energy
 from .geometry import periodic_square, periodic_vertex_charges, periodic_vertex_data
 from .model import IceDocument
-from .presets import PRESETS
+from .presets import SQUARE_CONFIGURATIONS, randomized
 from .validation import validate
 
 
@@ -238,17 +238,54 @@ class NewDocumentDialog(QDialog):
         return document
 
 
+class FoldablePane(QWidget):
+    def __init__(self, title: str, *, expanded: bool = True, parent=None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.header = QToolButton()
+        self.header.setText(title)
+        self.header.setCheckable(True)
+        self.header.setChecked(expanded)
+        self.header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.header.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.header.setStyleSheet(
+            "QToolButton { border: none; font-weight: 600; padding: 5px 2px; }"
+        )
+        self.header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.body = QWidget()
+        self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.body.setVisible(expanded)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        layout.addWidget(self.header)
+        layout.addWidget(self.body)
+        self.header.toggled.connect(self._set_expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.header.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.body.setVisible(expanded)
+
+
 class ParameterPanel(QWidget):
-    def __init__(self, document: IceDocument, change_callback, lattice_callback, parent=None) -> None:
+    def __init__(
+        self, document: IceDocument, change_callback, lattice_callback,
+        configuration_callback, parent=None,
+    ) -> None:
         super().__init__(parent)
         self.change_callback = change_callback
         self.lattice_callback = lattice_callback
+        self.configuration_callback = configuration_callback
         self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        lattice = QGroupBox("Lattice")
-        lattice_form = QFormLayout(lattice)
+        self.lattice_pane = FoldablePane("Lattice")
+        lattice_form = QFormLayout(self.lattice_pane.body)
         self.nx = QSpinBox(); self.nx.setRange(1, 200)
         self.ny = QSpinBox(); self.ny.setRange(1, 200)
         self.lattice_constant = self._number(8.374011537, 0.001, 1_000_000, 6)
@@ -259,29 +296,41 @@ class ParameterPanel(QWidget):
         lattice_form.addRow("Constant a (um)", self.lattice_constant)
         lattice_form.addRow("Box Lx x Ly", self.box_size)
         lattice_form.addRow(self.apply_lattice)
-        layout.addWidget(lattice)
+        layout.addWidget(self.lattice_pane)
 
-        traps = QGroupBox("Traps")
-        trap_form = QFormLayout(traps)
+        self.configuration_pane = FoldablePane("Configuration")
+        configuration_form = QFormLayout(self.configuration_pane.body)
+        self.configuration = QComboBox()
+        self.apply_configuration = QPushButton("Apply configuration")
+        self.configuration_note = QLabel()
+        self.configuration_note.setWordWrap(True)
+        self.configuration_note.setStyleSheet("color: #59656b;")
+        configuration_form.addRow("Pattern", self.configuration)
+        configuration_form.addRow(self.apply_configuration)
+        configuration_form.addRow(self.configuration_note)
+        layout.addWidget(self.configuration_pane)
+
+        self.traps_pane = FoldablePane("Traps", expanded=False)
+        trap_form = QFormLayout(self.traps_pane.body)
         self.trap_separation = self._number(3.0, 0.001, 1_000_000, 6)
         self.trap_height = self._number(8.0, 0, 1_000_000, 6)
         self.trap_stiffness = self._number(0.1, 0, 1_000_000, 6)
         trap_form.addRow("Separation (um)", self.trap_separation)
         trap_form.addRow("Height (pN nm)", self.trap_height)
         trap_form.addRow("Stiffness (pN/nm)", self.trap_stiffness)
-        layout.addWidget(traps)
+        layout.addWidget(self.traps_pane)
 
         parameters = EnergyParameters.from_mapping(document.energy_parameters)
-        particles = QGroupBox("Particles")
-        particle_form = QFormLayout(particles)
+        self.particles_pane = FoldablePane("Particles", expanded=False)
+        particle_form = QFormLayout(self.particles_pane.body)
         self.radius = self._number(parameters.particle_radius_um, 0.001, 1_000_000, 6)
         self.susceptibility = self._number(parameters.susceptibility, 0, 1_000_000, 8)
         particle_form.addRow("Radius (um)", self.radius)
         particle_form.addRow("Susceptibility", self.susceptibility)
-        layout.addWidget(particles)
+        layout.addWidget(self.particles_pane)
 
-        field_group = QGroupBox("Uniform field (spherical)")
-        field_form = QFormLayout(field_group)
+        self.field_pane = FoldablePane("Uniform field (spherical)")
+        field_form = QFormLayout(self.field_pane.body)
         self.field = self._number(parameters.field_mT, 0, 1_000_000, 6)
         self.colatitude = self._number(parameters.field_colatitude_deg, 0, 180, 3)
         self.azimuth = self._number(parameters.field_azimuth_deg, -360, 360, 3)
@@ -292,17 +341,17 @@ class ParameterPanel(QWidget):
         convention = QLabel("theta: from +z   |   phi: +x toward +y")
         convention.setStyleSheet("color: #59656b;")
         field_form.addRow(convention)
-        layout.addWidget(field_group)
+        layout.addWidget(self.field_pane)
 
-        calculation = QGroupBox("Interaction energy")
-        calculation_form = QFormLayout(calculation)
+        self.energy_pane = FoldablePane("Interaction energy")
+        calculation_form = QFormLayout(self.energy_pane.body)
         self.cutoff = self._number(parameters.cutoff_um, 0, 1_000_000, 6)
         self.energy_result = QLabel()
         self.energy_result.setWordWrap(True)
         self.energy_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         calculation_form.addRow("Cutoff (um; 0 = all)", self.cutoff)
         calculation_form.addRow(self.energy_result)
-        layout.addWidget(calculation)
+        layout.addWidget(self.energy_pane)
         layout.addStretch(1)
 
         for box in (self.radius, self.susceptibility, self.field,
@@ -311,6 +360,7 @@ class ParameterPanel(QWidget):
         for box in (self.nx, self.ny, self.lattice_constant):
             box.valueChanged.connect(self._update_box_size)
         self.apply_lattice.clicked.connect(self._apply_lattice)
+        self.apply_configuration.clicked.connect(self._apply_configuration)
         self.set_document(document)
 
     @staticmethod
@@ -346,6 +396,27 @@ class ParameterPanel(QWidget):
             box.setValue(value)
         generated_square = document.geometry == "square" and document.nx is not None and document.ny is not None
         self.apply_lattice.setEnabled(generated_square)
+        selected = self.configuration.currentText()
+        self.configuration.clear()
+        if generated_square:
+            even_shape = document.nx % 2 == 0 and document.ny % 2 == 0
+            names = ["Polarized"]
+            if even_shape:
+                names.extend(("2-in / 2-out", "4-in / 4-out"))
+            names.append("Randomize")
+            self.configuration.addItems(names)
+            parity_note = "" if even_shape else " Alternating patterns require even Nx and Ny."
+            self.configuration_note.setText(
+                "Square-lattice topology labels. Which pattern is energetically "
+                f"favored depends on the field and interaction parameters.{parity_note}"
+            )
+        else:
+            self.configuration.addItem("Randomize")
+            self.configuration_note.setText(
+                "Only randomization is available for this imported/custom lattice."
+            )
+        if selected and self.configuration.findText(selected) >= 0:
+            self.configuration.setCurrentText(selected)
         self._loading = False
         self._update_box_size()
 
@@ -360,6 +431,9 @@ class ParameterPanel(QWidget):
             self.nx.value(), self.ny.value(), self.lattice_constant.value(),
             self.trap_separation.value(), self.trap_height.value(), self.trap_stiffness.value(),
         )
+
+    def _apply_configuration(self) -> None:
+        self.configuration_callback(self.configuration.currentText())
 
     def _parameters_changed(self) -> None:
         if not self._loading:
@@ -423,9 +497,6 @@ class MainWindow(QMainWindow):
                        self.export_action, self.undo_action, self.redo_action, self.flip_action):
             toolbar.addAction(action)
         toolbar.addSeparator()
-        for name in PRESETS:
-            toolbar.addAction(self._action(name, lambda checked=False, n=name: self.apply_preset(n)))
-        toolbar.addSeparator()
         toolbar.addWidget(QLabel(" Charges "))
         self.charge_selector = QComboBox()
         self.charge_selector.addItems(["Off", "Nonzero", "All"])
@@ -436,7 +507,8 @@ class MainWindow(QMainWindow):
 
     def _create_parameter_dock(self) -> None:
         self.parameter_panel = ParameterPanel(
-            self.document, self.set_energy_parameters, self.apply_lattice_parameters, self,
+            self.document, self.set_energy_parameters, self.apply_lattice_parameters,
+            self.apply_configuration, self,
         )
         dock = QDockWidget("Physical parameters", self)
         dock.setObjectName("physical-parameters")
@@ -569,14 +641,19 @@ class MainWindow(QMainWindow):
         indices = [item.index for item in self.scene.selectedItems() if isinstance(item, TrapItem)]
         if indices: self.flip_indices(indices)
 
-    def apply_preset(self, name: str) -> None:
+    def apply_configuration(self, name: str) -> None:
         try:
-            values = PRESETS[name](self.document)
+            function = (
+                SQUARE_CONFIGURATIONS[name]
+                if name in SQUARE_CONFIGURATIONS else randomized
+            )
+            values = function(self.document)
             self.push_state_change(
                 lambda: self.document.set_occupancies(values, idealize=True),
                 f"Apply {name}",
             )
-        except ValueError as error: QMessageBox.warning(self, "Preset unavailable", str(error))
+        except ValueError as error:
+            QMessageBox.warning(self, "Configuration unavailable", str(error))
 
     def set_document(self, document: IceDocument, path: Path | None = None) -> None:
         self.document, self.project_path = document, path
