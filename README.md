@@ -33,6 +33,9 @@ rpy run aci-state-builder
 - Mark trajectory frames A and B for a lightweight visual comparison of
   particle displacements and flipped traps, with direct jumps back to either
   reference frame.
+- Open marked frames in a draggable side-by-side workspace with linked
+  navigation, optionally linked per-view overlays, corresponding-trap hover
+  highlighting, and a compact qualitative change summary.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
 - Save richer, versioned `.aci.json` project files.
 - Display periodic topological charges `q = N_in - N_out` as either nonzero-only
@@ -43,6 +46,9 @@ rpy run aci-state-builder
 - Show short particle trails from frames already held in the bounded cache;
   right-click a trap or particle to inspect and copy its coordinates, state,
   displacement, and imported metadata.
+- Switch to a canvas-only presentation mode, copy the canvas to the clipboard,
+  or export the current view (and either side of a comparison) as scaled PNG or
+  SVG with the active visual overlays.
 - Use a persistent right-hand parameter pane for lattice dimensions and spacing,
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.

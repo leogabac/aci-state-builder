@@ -7,14 +7,15 @@ import math
 import csv
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
-    QFrame, QHBoxLayout, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox, QStyle, QToolBar, QToolButton,
-    QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QInputDialog, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QStyle,
+    QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .formats import StateFormatError, document_from_frame, read_csv, write_csv
@@ -48,12 +49,16 @@ class Worker(QRunnable):
 
 
 class TrapItem(QGraphicsItem):
-    def __init__(self, index: int, document: IceDocument, flip_callback, inspect_callback) -> None:
+    def __init__(
+        self, index: int, document: IceDocument, flip_callback, inspect_callback,
+        hover_callback=None,
+    ) -> None:
         super().__init__()
         self.index = index
         self.document = document
         self.flip_callback = flip_callback
         self.inspect_callback = inspect_callback
+        self.hover_callback = hover_callback
         self._press_position: QPointF | None = None
         self.show_body = True
         self.show_particle = True
@@ -160,6 +165,16 @@ class TrapItem(QGraphicsItem):
         self.inspect_callback(self.index, event.screenPos())
         event.accept()
 
+    def hoverEnterEvent(self, event) -> None:
+        if self.hover_callback is not None:
+            self.hover_callback(self.trap.id, True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:
+        if self.hover_callback is not None:
+            self.hover_callback(self.trap.id, False)
+        super().hoverLeaveEvent(event)
+
 
 class ChargeItem(QGraphicsItem):
     COLORS = {
@@ -222,6 +237,7 @@ class VisualSnapshot:
     ids: tuple[int, ...]
     positions: np.ndarray
     occupancies: np.ndarray
+    document: IceDocument
 
 
 class BoundaryItem(QGraphicsItem):
@@ -332,6 +348,8 @@ class TrailItem(QGraphicsItem):
 
 
 class IceView(QGraphicsView):
+    transform_changed = Signal(object)
+
     def __init__(self, scene: QGraphicsScene) -> None:
         super().__init__(scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -374,6 +392,7 @@ class IceView(QGraphicsView):
         elif target > 250:
             factor = 250 / current
         self.scale(factor, factor)
+        self.transform_changed.emit(self.transform())
 
     def pan_by(self, dx: int, dy: int) -> None:
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - dx)
@@ -756,23 +775,28 @@ class ComparisonPane(FoldablePane):
         mark_b = QPushButton("Mark B"); jump_b = QPushButton("Go to B")
         mark_b_layout.addWidget(mark_b); mark_b_layout.addWidget(jump_b)
         self.show = QCheckBox("Show A → B displacement and flips")
+        self.side_by_side = QPushButton("Open side-by-side comparison…")
+        self.side_by_side.setEnabled(False)
         clear = QPushButton("Clear comparison")
         form.addRow("A", self.a); form.addRow(mark_row)
         form.addRow("B", self.b); form.addRow(mark_b_row)
-        form.addRow(self.show); form.addRow(clear)
+        form.addRow(self.show); form.addRow(self.side_by_side); form.addRow(clear)
         mark_a.clicked.connect(lambda: callback("mark_a"))
         mark_b.clicked.connect(lambda: callback("mark_b"))
         jump_a.clicked.connect(lambda: callback("jump_a"))
         jump_b.clicked.connect(lambda: callback("jump_b"))
         clear.clicked.connect(lambda: callback("clear"))
+        self.side_by_side.clicked.connect(lambda: callback("side_by_side"))
         self.show.toggled.connect(lambda: callback("show"))
         self.setVisible(False)
 
     def set_marker(self, name: str, text: str) -> None:
         getattr(self, name.lower()).setText(text)
+        self.side_by_side.setEnabled(self.a.text() != "not marked" and self.b.text() != "not marked")
 
     def clear_markers(self) -> None:
         self.a.setText("not marked"); self.b.setText("not marked")
+        self.side_by_side.setEnabled(False)
         self.show.blockSignals(True); self.show.setChecked(False); self.show.blockSignals(False)
 
 
@@ -802,6 +826,195 @@ class OverlayPane(FoldablePane):
         self.charges.currentTextChanged.connect(callback)
         self.trails.toggled.connect(callback)
         self.trail_length.valueChanged.connect(callback)
+
+
+class SnapshotPanel(QWidget):
+    overlay_changed = Signal()
+
+    def __init__(self, snapshot: VisualSnapshot, hover_callback, parent=None) -> None:
+        super().__init__(parent)
+        self.snapshot = snapshot
+        self.document = snapshot.document
+        layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(4)
+        controls = QHBoxLayout()
+        title = QLabel(f"Frame {snapshot.frame_value}"); title.setStyleSheet("font-weight: 700;")
+        self.traps = QCheckBox("Traps"); self.traps.setChecked(True)
+        self.particles = QCheckBox("Particles"); self.particles.setChecked(True)
+        self.ids = QCheckBox("IDs")
+        self.charges = QComboBox(); self.charges.addItems(["Off", "Nonzero", "All"])
+        self.charges.setCurrentText("Nonzero")
+        controls.addWidget(title); controls.addStretch(1)
+        for widget in (self.traps, self.particles, self.ids): controls.addWidget(widget)
+        controls.addWidget(QLabel("Charges")); controls.addWidget(self.charges)
+        layout.addLayout(controls)
+        self.scene = QGraphicsScene(self)
+        self.view = IceView(self.scene); self.view.scale_units = self.document.units
+        self.view.show_charge_legend = False
+        parameters = EnergyParameters.from_mapping(self.document.energy_parameters)
+        self.view.set_field_direction(parameters.field_colatitude_deg, parameters.field_azimuth_deg)
+        layout.addWidget(self.view, 1)
+        self.items_by_id: dict[int, TrapItem] = {}
+        for index, trap in enumerate(self.document.traps):
+            item = TrapItem(index, self.document, lambda indices: None, self._show_context, hover_callback)
+            item.setAcceptedMouseButtons(Qt.MouseButton.RightButton)
+            item.setPos(float(trap.center[0]), float(-trap.center[1]))
+            item.setToolTip(f"id {trap.id}")
+            self.scene.addItem(item); self.items_by_id[trap.id] = item
+        self.boundary_item = None
+        if (self.document.geometry == "square" and self.document.nx is not None
+                and self.document.ny is not None and self.document.lattice_constant is not None):
+            lx = self.document.nx * self.document.lattice_constant
+            ly = self.document.ny * self.document.lattice_constant
+            width = max(self.document.trap_separation * 0.055, 0.035)
+            self.boundary_item = BoundaryItem(QRectF(0, -ly, lx, ly), width)
+            self.scene.addItem(self.boundary_item)
+        self.charge_items: list[ChargeItem] = []
+        self._apply_overlays()
+        margin = max(self.document.trap_separation, 1.0)
+        self.content_rect = self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin)
+        pad_x, pad_y = self.content_rect.width() * 5, self.content_rect.height() * 5
+        self.scene.setSceneRect(self.content_rect.adjusted(-pad_x, -pad_y, pad_x, pad_y))
+        self.fit()
+        for widget in (self.traps, self.particles, self.ids):
+            widget.toggled.connect(self._changed)
+        self.charges.currentTextChanged.connect(self._changed)
+
+    def _changed(self, *unused) -> None:
+        del unused
+        self._apply_overlays(); self.overlay_changed.emit()
+
+    def _apply_overlays(self) -> None:
+        for item in self.items_by_id.values():
+            item.show_body = self.traps.isChecked()
+            item.show_particle = self.particles.isChecked()
+            item.show_id = self.ids.isChecked()
+            item.update()
+        for item in self.charge_items:
+            self.scene.removeItem(item)
+        self.charge_items.clear()
+        mode = self.charges.currentText()
+        if mode != "Off":
+            radius = max(self.document.trap_separation * 0.40, 0.5)
+            for ix, iy, x, y, charge in periodic_vertex_data(self.document):
+                if mode == "Nonzero" and charge == 0:
+                    continue
+                item = ChargeItem(charge, radius); item.setPos(x, -y)
+                item.setToolTip(f"periodic vertex ({ix}, {iy}) | q = {charge:+d}")
+                self.scene.addItem(item); self.charge_items.append(item)
+        self.view.viewport().update()
+
+    def overlay_settings(self) -> tuple[bool, bool, bool, str]:
+        return self.traps.isChecked(), self.particles.isChecked(), self.ids.isChecked(), self.charges.currentText()
+
+    def set_overlay_settings(self, settings: tuple[bool, bool, bool, str]) -> None:
+        widgets = (self.traps, self.particles, self.ids)
+        for widget, value in zip(widgets, settings[:3], strict=True):
+            widget.blockSignals(True); widget.setChecked(value); widget.blockSignals(False)
+        self.charges.blockSignals(True); self.charges.setCurrentText(settings[3]); self.charges.blockSignals(False)
+        self._apply_overlays()
+
+    def fit(self) -> None:
+        self.view.setTransform(QTransform())
+        self.view.fitInView(self.content_rect, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _show_context(self, index: int, screen_position) -> None:
+        trap = self.document.traps[index]
+        displacement = trap.displayed_displacement(self.document.trap_separation)
+        text = (
+            f"id: {trap.id}\ncenter: {', '.join(f'{v:.7g}' for v in trap.center)}\n"
+            f"occupancy: {trap.occupancy:+d}\n"
+            f"displacement: {', '.join(f'{v:.7g}' for v in displacement)}"
+        )
+        menu = QMenu(self); menu.addSection(f"Trap {trap.id}")
+        copy = menu.addAction("Copy details")
+        if menu.exec(screen_position) is copy:
+            QApplication.clipboard().setText(text)
+
+
+class ComparisonDialog(QDialog):
+    def __init__(self, first: VisualSnapshot, second: VisualSnapshot, export_callback, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Compare frames {first.frame_value} and {second.frame_value}")
+        self.resize(1350, 760)
+        self._syncing = False
+        self._closing = False
+        self.navigation_linked = True
+        self.overlays_linked = True
+        layout = QVBoxLayout(self)
+        movement = np.linalg.norm(second.positions - first.positions, axis=1)
+        flips = int(np.count_nonzero(first.occupancies != second.occupancies))
+        summary = QLabel(
+            f"{flips:,} flipped traps   ·   maximum displacement {movement.max(initial=0):.5g} "
+            f"{first.document.units}   ·   mean displacement {movement.mean() if movement.size else 0:.5g} {first.document.units}"
+        )
+        summary.setStyleSheet("font-weight: 600; padding: 4px;")
+        controls = QHBoxLayout(); controls.addWidget(summary); controls.addStretch(1)
+        self.link_navigation = QCheckBox("Link navigation"); self.link_navigation.setChecked(True)
+        self.link_overlays = QCheckBox("Link overlays"); self.link_overlays.setChecked(True)
+        self.link_navigation.toggled.connect(lambda value: setattr(self, "navigation_linked", value))
+        self.link_overlays.toggled.connect(lambda value: setattr(self, "overlays_linked", value))
+        fit = QPushButton("Fit both")
+        export_a = QPushButton("Export A…"); export_b = QPushButton("Export B…")
+        for widget in (self.link_navigation, self.link_overlays, fit, export_a, export_b): controls.addWidget(widget)
+        layout.addLayout(controls)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.left = SnapshotPanel(first, self._highlight, splitter)
+        self.right = SnapshotPanel(second, self._highlight, splitter)
+        splitter.addWidget(self.left); splitter.addWidget(self.right); splitter.setSizes([675, 675])
+        layout.addWidget(splitter, 1)
+        self.left.overlay_changed.connect(lambda: self._overlay_changed(self.left, self.right))
+        self.right.overlay_changed.connect(lambda: self._overlay_changed(self.right, self.left))
+        self.left.view.transform_changed.connect(lambda transform: self._copy_transform(self.left, self.right, transform))
+        self.right.view.transform_changed.connect(lambda transform: self._copy_transform(self.right, self.left, transform))
+        for first_bar, second_bar in (
+            (self.left.view.horizontalScrollBar(), self.right.view.horizontalScrollBar()),
+            (self.left.view.verticalScrollBar(), self.right.view.verticalScrollBar()),
+        ):
+            first_bar.valueChanged.connect(lambda value, a=first_bar, b=second_bar: self._copy_scroll(a, b, value))
+            second_bar.valueChanged.connect(lambda value, a=second_bar, b=first_bar: self._copy_scroll(a, b, value))
+        fit.clicked.connect(self._fit_both)
+        export_a.clicked.connect(lambda: export_callback(self.left.view, f"frame-{first.frame_value}"))
+        export_b.clicked.connect(lambda: export_callback(self.right.view, f"frame-{second.frame_value}"))
+
+    def _highlight(self, trap_id: int, highlighted: bool) -> None:
+        for panel in (self.left, self.right):
+            item = panel.items_by_id.get(trap_id)
+            if item is not None:
+                item.setSelected(highlighted)
+
+    def _overlay_changed(self, source: SnapshotPanel, target: SnapshotPanel) -> None:
+        if not self._closing and self.overlays_linked and not self._syncing:
+            self._syncing = True; target.set_overlay_settings(source.overlay_settings()); self._syncing = False
+
+    def _copy_transform(self, source: SnapshotPanel, target: SnapshotPanel, transform) -> None:
+        if self._closing or not self.navigation_linked or self._syncing:
+            return
+        self._syncing = True
+        try:
+            center = source.view.mapToScene(source.view.viewport().rect().center())
+            target.view.setTransform(transform); target.view.centerOn(center)
+        except RuntimeError:
+            self._closing = True
+        finally:
+            self._syncing = False
+
+    def _copy_scroll(self, source, target, value: int) -> None:
+        if self._closing or not self.navigation_linked or self._syncing:
+            return
+        try:
+            span = source.maximum() - source.minimum()
+            ratio = 0 if span == 0 else (value - source.minimum()) / span
+            mapped = round(target.minimum() + ratio * (target.maximum() - target.minimum()))
+            self._syncing = True; target.setValue(mapped); self._syncing = False
+        except RuntimeError:
+            self._closing = True
+
+    def _fit_both(self) -> None:
+        self._syncing = True; self.left.fit(); self.right.fit(); self._syncing = False
+
+    def closeEvent(self, event) -> None:
+        self._closing = True
+        super().closeEvent(event)
 
 
 class ParameterPanel(QWidget):
@@ -1039,6 +1252,7 @@ class MainWindow(QMainWindow):
         self.trail_item: TrailItem | None = None
         self.comparison_a: VisualSnapshot | None = None
         self.comparison_b: VisualSnapshot | None = None
+        self.comparison_dialog: ComparisonDialog | None = None
         self.undo_stack = QUndoStack(self)
         self.scene = QGraphicsScene(self); self.scene.selectionChanged.connect(self.update_status)
         self.view = IceView(self.scene); self.status = QLabel()
@@ -1074,6 +1288,11 @@ class MainWindow(QMainWindow):
         self.zoom_in_action = self._action("Zoom in", self.zoom_in, QKeySequence("Ctrl++"))
         self.zoom_out_action = self._action("Zoom out", self.zoom_out, QKeySequence("Ctrl+-"))
         self.actual_size_action = self._action("100%", self.actual_size, QKeySequence("Ctrl+1"))
+        self.export_image_action = self._action("Export image…", self.export_current_view, QKeySequence("Ctrl+Shift+E"))
+        self.copy_image_action = self._action("Copy canvas image", self.copy_current_view)
+        self.presentation_action = self._action("Canvas-only mode", self.toggle_presentation_mode, QKeySequence("Tab"))
+        self.presentation_action.setCheckable(True)
+        self.addAction(self.presentation_action)
         self.addAction(self.play_action)
 
         icon = self.style().standardIcon
@@ -1085,6 +1304,7 @@ class MainWindow(QMainWindow):
         self.undo_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowBack))
         self.redo_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowForward))
         self.validate_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.export_image_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.zoom_in_action.setToolTip("Zoom in (Ctrl++)")
         self.zoom_out_action.setToolTip("Zoom out (Ctrl+-)")
         self.actual_size_action.setToolTip("Reset view to 100% (Ctrl+1)")
@@ -1092,20 +1312,23 @@ class MainWindow(QMainWindow):
     def _create_menus(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         for action in (self.new_action, self.open_action, self.save_action, None,
-                       self.import_action, self.trajectory_action, self.export_action):
+                       self.import_action, self.trajectory_action, self.export_action,
+                       self.export_image_action, self.copy_image_action):
             file_menu.addSeparator() if action is None else file_menu.addAction(action)
         edit_menu = self.menuBar().addMenu("&Edit")
         for action in (self.undo_action, self.redo_action, None, self.flip_action):
             edit_menu.addSeparator() if action is None else edit_menu.addAction(action)
         view_menu = self.menuBar().addMenu("&View")
         for action in (self.zoom_in_action, self.zoom_out_action,
-                       self.actual_size_action, self.fit_action):
-            view_menu.addAction(action)
+                       self.actual_size_action, self.fit_action, None,
+                       self.presentation_action):
+            view_menu.addSeparator() if action is None else view_menu.addAction(action)
         tools_menu = self.menuBar().addMenu("&Tools")
         tools_menu.addAction(self.validate_action)
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("Main", self); toolbar.setMovable(False); self.addToolBar(toolbar)
+        self.main_toolbar = toolbar
         toolbar.setObjectName("main-toolbar")
         toolbar.setIconSize(QSize(18, 18))
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -1147,6 +1370,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         for action in (self.zoom_out_action, self.zoom_in_action, self.fit_action):
             toolbar.addAction(action)
+        toolbar.addSeparator(); toolbar.addAction(self.export_image_action)
 
     def _create_parameter_dock(self) -> None:
         self.parameter_panel = ParameterPanel(
@@ -1177,6 +1401,7 @@ class MainWindow(QMainWindow):
         scroll.setStyleSheet("QScrollArea { background: palette(window); border: none; }")
         scroll.setWidget(self.parameter_panel)
         dock.setWidget(scroll)
+        self.parameter_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     def rebuild_scene(self, *, fit: bool = True) -> None:
@@ -1342,6 +1567,87 @@ class MainWindow(QMainWindow):
         center = self.view.mapToScene(self.view.viewport().rect().center())
         self.view.setTransform(QTransform())
         self.view.centerOn(center)
+
+    def export_current_view(self) -> None:
+        name = self.document.name or "aci-view"
+        self.export_view(self.view, name)
+
+    def export_view(self, view: IceView, suggested_name: str) -> None:
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export canvas image", f"{suggested_name}.png",
+            "PNG image (*.png);;SVG vector image (*.svg)",
+        )
+        if not filename:
+            return
+        scale, accepted = QInputDialog.getDouble(
+            self, "Export resolution", "Resolution scale", 2.0, 0.5, 8.0, 1,
+        )
+        if not accepted:
+            return
+        background = QMessageBox.question(
+            self, "Image background", "Use a transparent background?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+        )
+        if background == QMessageBox.StandardButton.Cancel:
+            return
+        transparent = background == QMessageBox.StandardButton.Yes
+        try:
+            self._write_view_image(view, Path(filename), scale, transparent)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not export image", str(error))
+
+    @staticmethod
+    def _write_view_image(view: IceView, path: Path, scale: float, transparent: bool) -> None:
+        size = view.viewport().size()
+        width, height = max(1, round(size.width() * scale)), max(1, round(size.height() * scale))
+        old_brush = view.backgroundBrush()
+        if transparent:
+            view.setBackgroundBrush(Qt.BrushStyle.NoBrush)
+        try:
+            if path.suffix.lower() == ".svg":
+                generator = QSvgGenerator(); generator.setFileName(str(path))
+                generator.setSize(QSize(width, height)); generator.setViewBox(QRectF(0, 0, width, height))
+                generator.setTitle("ACI State Builder canvas")
+                painter = QPainter(generator)
+            else:
+                if path.suffix.lower() != ".png":
+                    path = path.with_suffix(".png")
+                image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+                image.fill(Qt.GlobalColor.transparent if transparent else view.palette().color(QPalette.ColorRole.Base))
+                painter = QPainter(image)
+            try:
+                view.render(
+                    painter, QRectF(0, 0, width, height), view.viewport().rect(),
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                )
+            finally:
+                painter.end()
+            if path.suffix.lower() != ".svg" and not image.save(str(path)):
+                raise OSError(f"could not write {path}")
+        finally:
+            view.setBackgroundBrush(old_brush)
+            view.viewport().update()
+
+    def copy_current_view(self) -> None:
+        size = self.view.viewport().size()
+        image = QImage(size, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(self.view.palette().color(QPalette.ColorRole.Base))
+        painter = QPainter(image)
+        self.view.render(
+            painter, QRectF(0, 0, size.width(), size.height()),
+            self.view.viewport().rect(), Qt.AspectRatioMode.IgnoreAspectRatio,
+        )
+        painter.end(); QApplication.clipboard().setImage(image)
+
+    def toggle_presentation_mode(self, enabled: bool) -> None:
+        self.main_toolbar.setVisible(not enabled)
+        self.parameter_dock.setVisible(not enabled)
+        self.menuBar().setVisible(not enabled)
+        self.status.setVisible(not enabled)
+        self.playback.setVisible(not enabled and self.trajectory_session is not None)
+        if enabled:
+            self.view.setFocus()
 
     def update_status(self) -> None:
         selected = len([item for item in self.scene.selectedItems() if isinstance(item, TrapItem)])
@@ -1678,6 +1984,7 @@ class MainWindow(QMainWindow):
             self.current_trajectory_position, entry.value,
             tuple(trap.id for trap in self.document.traps),
             np.asarray(positions, dtype=float), self.document.occupancies().copy(),
+            IceDocument.from_dict(self.document.to_dict()),
         )
 
     def comparison_action(self, action: str) -> None:
@@ -1701,6 +2008,32 @@ class MainWindow(QMainWindow):
         elif action == "clear":
             self.comparison_a = None; self.comparison_b = None
             pane.clear_markers()
+        elif action == "side_by_side":
+            first, second = self.comparison_a, self.comparison_b
+            if first is None or second is None:
+                return
+            if first.ids != second.ids:
+                QMessageBox.warning(
+                    self, "Frames cannot be compared",
+                    "Frames A and B do not contain the same ordered trap IDs.",
+                )
+                return
+            if self.comparison_dialog is not None:
+                self.comparison_dialog.close()
+            dialog = ComparisonDialog(first, second, self.export_view, self)
+            overlay = self.parameter_panel.overlay_pane
+            settings = (
+                overlay.traps.isChecked(), overlay.particles.isChecked(),
+                overlay.ids.isChecked(), overlay.charges.currentText(),
+            )
+            dialog.left.set_overlay_settings(settings); dialog.right.set_overlay_settings(settings)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            def clear_dialog(*unused, target=dialog) -> None:
+                del unused
+                if self.comparison_dialog is target:
+                    self.comparison_dialog = None
+            dialog.destroyed.connect(clear_dialog)
+            self.comparison_dialog = dialog; dialog.show()
         self.rebuild_comparison_overlay()
 
     def rebuild_comparison_overlay(self) -> None:

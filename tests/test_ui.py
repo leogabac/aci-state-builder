@@ -66,12 +66,38 @@ class TrajectoryUiTests(unittest.TestCase):
                 self.assertIsNotNone(window.comparison_item)
                 self.assertEqual(window.comparison_a.position, 0)
                 self.assertEqual(window.comparison_b.position, 3)
+                window.comparison_action("side_by_side")
+                QApplication.processEvents()
+                dialog = window.comparison_dialog
+                self.assertIsNotNone(dialog)
+                dialog.left.traps.setChecked(False)
+                self.assertFalse(dialog.right.traps.isChecked())
+                dialog.left.view.zoom_by(1.25)
+                self.assertAlmostEqual(
+                    dialog.left.view.transform().m11(),
+                    dialog.right.view.transform().m11(),
+                )
+                trap_id = window.comparison_a.ids[0]
+                dialog._highlight(trap_id, True)
+                self.assertTrue(dialog.left.items_by_id[trap_id].isSelected())
+                self.assertTrue(dialog.right.items_by_id[trap_id].isSelected())
                 window.parameter_panel.overlay_pane.traps.setChecked(False)
                 self.assertTrue(all(not item.show_body for item in window.trap_items))
                 self.assertIsNotNone(window.boundary_item)
                 window.parameter_panel.overlay_pane.trails.setChecked(True)
                 self.assertIsNotNone(window.trail_item)
                 self.assertEqual(window.trail_item.positions.shape, (4, 8, 2))
+                png = root / "canvas.png"; svg = root / "canvas.svg"
+                window._write_view_image(window.view, png, 1.0, False)
+                window._write_view_image(window.view, svg, 1.0, True)
+                self.assertGreater(png.stat().st_size, 100)
+                self.assertGreater(svg.stat().st_size, 100)
+                window.presentation_action.setChecked(True)
+                window.toggle_presentation_mode(True)
+                self.assertTrue(window.main_toolbar.isHidden())
+                self.assertTrue(window.parameter_dock.isHidden())
+                window.presentation_action.setChecked(False)
+                window.toggle_presentation_mode(False)
                 horizontal = window.view.horizontalScrollBar()
                 vertical = window.view.verticalScrollBar()
                 before = horizontal.value(), vertical.value()
