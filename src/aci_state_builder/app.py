@@ -6,13 +6,14 @@ import math
 import csv
 
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, QThreadPool, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter, QPainterPath, QPen, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
-    QHBoxLayout, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QStyle, QToolBar, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from .formats import StateFormatError, document_from_frame, read_csv, write_csv
@@ -93,21 +94,27 @@ class TrapItem(QGraphicsItem):
                        -half - radius * 0.72, radius * 0.78, -half - radius * 0.72, 0)
         peanut.closeSubpath()
 
-        outline = QColor("#e78632") if self.isSelected() else QColor("#52717c")
+        palette = QApplication.palette()
+        outline = (
+            palette.color(QPalette.ColorRole.Highlight)
+            if self.isSelected() else palette.color(QPalette.ColorRole.Mid)
+        )
         painter.save()
         painter.rotate(angle)
         painter.setPen(QPen(outline, max(radius * 0.13, 0.035)))
-        painter.setBrush(QBrush(QColor("#dce7e8")))
+        painter.setBrush(QBrush(palette.color(QPalette.ColorRole.AlternateBase)))
         painter.drawPath(peanut)
-        painter.setPen(QPen(QColor(90, 119, 128, 105), max(radius * 0.07, 0.025), Qt.PenStyle.DashLine))
+        barrier = palette.color(QPalette.ColorRole.Mid)
+        barrier.setAlpha(135)
+        painter.setPen(QPen(barrier, max(radius * 0.07, 0.025), Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(0, -waist * 0.72), QPointF(0, waist * 0.72))
         painter.restore()
 
         displacement = self.trap.displayed_displacement(self.document.trap_separation)
         occupied = QPointF(float(displacement[0]), float(-displacement[1]))
         particle_radius = radius * 0.62
-        painter.setPen(QPen(QColor("#f7fbfc"), max(radius * 0.11, 0.035)))
-        painter.setBrush(QBrush(QColor("#173b47")))
+        painter.setPen(QPen(palette.color(QPalette.ColorRole.Base), max(radius * 0.11, 0.035)))
+        painter.setBrush(QBrush(palette.color(QPalette.ColorRole.Text)))
         painter.drawEllipse(occupied, particle_radius, particle_radius)
 
     def mousePressEvent(self, event) -> None:
@@ -150,11 +157,17 @@ class ChargeItem(QGraphicsItem):
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         del option, widget
-        color = self.COLORS.get(self.q, QColor("#6b2737") if self.q > 0 else QColor("#243b6b"))
-        painter.setPen(QPen(QColor("#ffffff"), self.radius * 0.12))
+        palette = QApplication.palette()
+        color = (
+            palette.color(QPalette.ColorRole.Mid)
+            if self.q == 0 else self.COLORS.get(
+                self.q, QColor("#6b2737") if self.q > 0 else QColor("#243b6b")
+            )
+        )
+        painter.setPen(QPen(palette.color(QPalette.ColorRole.Base), self.radius * 0.12))
         painter.setBrush(QBrush(color))
         painter.drawEllipse(self.boundingRect())
-        text_color = QColor("#ffffff") if self.q else QColor("#53636b")
+        text_color = QColor("#ffffff") if self.q else palette.color(QPalette.ColorRole.Text)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(text_color))
         font = QFont(painter.font())
@@ -179,13 +192,67 @@ class IceView(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setBackgroundBrush(QColor("#f7f8f4"))
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self._apply_palette()
         self.field_colatitude_deg = 90.0
         self.field_azimuth_deg = 0.0
+        self._middle_panning = False
+        self._pan_position = None
+        self.setToolTip("Mouse wheel: zoom · Middle-drag: pan · Drag: select traps")
+
+    def _apply_palette(self) -> None:
+        self.setBackgroundBrush(self.palette().color(QPalette.ColorRole.Base))
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self._apply_palette()
+            self.viewport().update()
 
     def wheelEvent(self, event) -> None:
         factor = 1.18 if event.angleDelta().y() > 0 else 1 / 1.18
+        self.zoom_by(factor)
+
+    def zoom_by(self, factor: float) -> None:
+        current = abs(self.transform().m11())
+        target = current * factor
+        if target < 0.015:
+            factor = 0.015 / current
+        elif target > 250:
+            factor = 250 / current
         self.scale(factor, factor)
+
+    def pan_by(self, dx: int, dy: int) -> None:
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - dx)
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() - dy)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._middle_panning = True
+            self._pan_position = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._middle_panning and self._pan_position is not None:
+            position = event.position().toPoint()
+            delta = position - self._pan_position
+            self._pan_position = position
+            self.pan_by(delta.x(), delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton and self._middle_panning:
+            self._middle_panning = False
+            self._pan_position = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def set_field_direction(self, colatitude_deg: float, azimuth_deg: float) -> None:
         self.field_colatitude_deg = colatitude_deg
@@ -207,11 +274,12 @@ class IceView(QGraphicsView):
             20 * np.sin(theta) * np.cos(phi),
             -20 * np.sin(theta) * np.sin(phi),
         )
-        painter.setPen(QPen(QColor("#20252b"), 2.6))
+        direction_color = self.palette().color(QPalette.ColorRole.Text)
+        painter.setPen(QPen(direction_color, 2.6))
         painter.drawLine(origin, endpoint)
-        painter.setBrush(QBrush(QColor("#20252b")))
+        painter.setBrush(QBrush(direction_color))
         painter.drawEllipse(endpoint, 2.8, 2.8)
-        painter.setPen(QPen(QColor("#4d5860")))
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
         painter.drawText(QPointF(12, 72), f"B, z={np.cos(theta):+.2f}")
         painter.restore()
 
@@ -245,11 +313,12 @@ class FieldDirectionPreview(QWidget):
             + z_axis * np.cos(theta)
         )
         endpoint = origin + direction
-        painter.setPen(QPen(QColor("#20252b"), 3.0))
+        direction_color = self.palette().color(QPalette.ColorRole.Text)
+        painter.setPen(QPen(direction_color, 3.0))
         painter.drawLine(origin, endpoint)
-        painter.setBrush(QBrush(QColor("#20252b")))
+        painter.setBrush(QBrush(direction_color))
         painter.drawEllipse(endpoint, 3.5, 3.5)
-        painter.setPen(QPen(QColor("#4d5860")))
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
         painter.drawText(QPointF(112, 25), "field B")
 
 
@@ -289,10 +358,13 @@ class NewDocumentDialog(QDialog):
 class FoldablePane(QWidget):
     def __init__(self, title: str, *, expanded: bool = True, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("foldablePane")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
         self.header = QToolButton()
+        self.header.setObjectName("foldableHeader")
         self.header.setText(title)
         self.header.setCheckable(True)
         self.header.setChecked(expanded)
@@ -300,13 +372,44 @@ class FoldablePane(QWidget):
         self.header.setArrowType(
             Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
         )
-        self.header.setStyleSheet(
-            "QToolButton { border: none; font-weight: 600; padding: 5px 2px; }"
-        )
         self.header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.body = QWidget()
+        self.body.setObjectName("foldableBody")
         self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.body.setVisible(expanded)
+        self.setStyleSheet("""
+            QWidget#foldablePane {
+                background: palette(base);
+                border: 1px solid palette(mid);
+                border-radius: 7px;
+            }
+            QToolButton#foldableHeader {
+                background: palette(alternate-base);
+                border: none;
+                border-radius: 6px;
+                color: palette(text);
+                font-size: 13px;
+                font-weight: 650;
+                padding: 8px 9px;
+                text-align: left;
+            }
+            QToolButton#foldableHeader:checked {
+                background: palette(button);
+                border-bottom-left-radius: 0;
+                border-bottom-right-radius: 0;
+            }
+            QToolButton#foldableHeader:hover {
+                background: palette(highlight);
+                color: palette(highlighted-text);
+            }
+            QWidget#foldableBody {
+                background: palette(base);
+                border: none;
+                border-top: 1px solid palette(mid);
+                border-bottom-left-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+        """)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout.addWidget(self.header)
         layout.addWidget(self.body)
@@ -448,7 +551,7 @@ class TrajectoryPane(FoldablePane):
         )
         mib = (self.metadata.particles_per_frame * len(self.metadata.columns)
                * 8 * cached_frames / 2**20)
-        self.memory.setText(f"≈ {mib:.0f} MiB maximum")
+        self.memory.setText(f"≈ {mib:.1f} MiB maximum" if mib < 10 else f"≈ {mib:.0f} MiB maximum")
 
 
 class ParameterPanel(QWidget):
@@ -463,7 +566,18 @@ class ParameterPanel(QWidget):
         self.configuration_callback = configuration_callback
         self._loading = False
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(9, 9, 9, 12)
+        layout.setSpacing(8)
+        self.setStyleSheet("""
+            ParameterPanel { background: palette(window); }
+            QFormLayout { spacing: 7px; }
+            QLabel { color: palette(text); }
+            QSpinBox, QDoubleSpinBox, QComboBox {
+                min-height: 23px;
+                padding-left: 4px;
+            }
+            QPushButton { min-height: 25px; }
+        """)
 
         self.trajectory_pane = TrajectoryPane(
             trajectory_settings_callback, extract_frame_callback, self,
@@ -490,7 +604,7 @@ class ParameterPanel(QWidget):
         self.apply_configuration = QPushButton("Apply configuration")
         self.configuration_note = QLabel()
         self.configuration_note.setWordWrap(True)
-        self.configuration_note.setStyleSheet("color: #59656b;")
+        self.configuration_note.setStyleSheet("color: palette(mid);")
         configuration_form.addRow("Pattern", self.configuration)
         configuration_form.addRow(self.apply_configuration)
         configuration_form.addRow(self.configuration_note)
@@ -525,7 +639,7 @@ class ParameterPanel(QWidget):
         field_form.addRow("Azimuth phi (deg)", self.azimuth)
         field_form.addRow(FieldDirectionPreview(self.colatitude, self.azimuth, self))
         convention = QLabel("theta: from +z   |   phi: +x toward +y")
-        convention.setStyleSheet("color: #59656b;")
+        convention.setStyleSheet("color: palette(mid);")
         field_form.addRow(convention)
         layout.addWidget(self.field_pane)
 
@@ -675,7 +789,7 @@ class MainWindow(QMainWindow):
         self.play_timer = QTimer(self); self.play_timer.timeout.connect(self.advance_trajectory)
         self.seek_timer = QTimer(self); self.seek_timer.setSingleShot(True)
         self.seek_timer.timeout.connect(self._request_pending_frame)
-        self._create_actions(); self._create_toolbar(); self._create_parameter_dock(); self.rebuild_scene()
+        self._create_actions(); self._create_menus(); self._create_toolbar(); self._create_parameter_dock(); self.rebuild_scene()
 
     def _action(self, text: str, callback, shortcut=None) -> QAction:
         action = QAction(text, self); action.triggered.connect(callback)
@@ -684,8 +798,8 @@ class MainWindow(QMainWindow):
 
     def _create_actions(self) -> None:
         self.new_action = self._action("New", self.new_document, QKeySequence.StandardKey.New)
-        self.open_action = self._action("Open project", self.open_project, QKeySequence.StandardKey.Open)
-        self.save_action = self._action("Save project", self.save_project, QKeySequence.StandardKey.Save)
+        self.open_action = self._action("Open", self.open_project, QKeySequence.StandardKey.Open)
+        self.save_action = self._action("Save", self.save_project, QKeySequence.StandardKey.Save)
         self.import_action = self._action("Import state", self.import_csv)
         self.trajectory_action = self._action("Open trajectory", self.open_trajectory)
         self.export_action = self._action("Export CSV", self.export_csv)
@@ -697,22 +811,69 @@ class MainWindow(QMainWindow):
         self.redo_action = self.undo_stack.createRedoAction(self, "Redo")
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         self.play_action = self._action("Play / pause trajectory", self.toggle_playback, QKeySequence("Space"))
+        self.zoom_in_action = self._action("Zoom in", self.zoom_in, QKeySequence("Ctrl++"))
+        self.zoom_out_action = self._action("Zoom out", self.zoom_out, QKeySequence("Ctrl+-"))
+        self.actual_size_action = self._action("100%", self.actual_size, QKeySequence("Ctrl+1"))
         self.addAction(self.play_action)
+
+        icon = self.style().standardIcon
+        self.new_action.setIcon(icon(QStyle.StandardPixmap.SP_FileIcon))
+        self.open_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.save_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.import_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowDown))
+        self.trajectory_action.setIcon(icon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.undo_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowBack))
+        self.redo_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowForward))
+        self.validate_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.zoom_in_action.setToolTip("Zoom in (Ctrl++)")
+        self.zoom_out_action.setToolTip("Zoom out (Ctrl+-)")
+        self.actual_size_action.setToolTip("Reset view to 100% (Ctrl+1)")
+
+    def _create_menus(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+        for action in (self.new_action, self.open_action, self.save_action, None,
+                       self.import_action, self.trajectory_action, self.export_action):
+            file_menu.addSeparator() if action is None else file_menu.addAction(action)
+        edit_menu = self.menuBar().addMenu("&Edit")
+        for action in (self.undo_action, self.redo_action, None, self.flip_action):
+            edit_menu.addSeparator() if action is None else edit_menu.addAction(action)
+        view_menu = self.menuBar().addMenu("&View")
+        for action in (self.zoom_in_action, self.zoom_out_action,
+                       self.actual_size_action, self.fit_action):
+            view_menu.addAction(action)
+        tools_menu = self.menuBar().addMenu("&Tools")
+        tools_menu.addAction(self.validate_action)
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("Main", self); toolbar.setMovable(False); self.addToolBar(toolbar)
-        for action in (self.new_action, self.open_action, self.save_action, self.import_action,
-                       self.trajectory_action,
-                       self.export_action, self.undo_action, self.redo_action, self.flip_action):
+        toolbar.setObjectName("main-toolbar")
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.setStyleSheet("""
+            QToolBar { background: palette(window); border-bottom: 1px solid palette(mid); spacing: 3px; padding: 3px; }
+            QToolButton { padding: 4px 6px; border-radius: 4px; }
+            QToolButton:hover { background: palette(alternate-base); }
+        """)
+        for action in (self.new_action, self.open_action, self.save_action):
             toolbar.addAction(action)
         toolbar.addSeparator()
-        toolbar.addWidget(QLabel(" Charges "))
+        for action in (self.import_action, self.trajectory_action):
+            toolbar.addAction(action)
+        toolbar.addSeparator()
+        for action in (self.undo_action, self.redo_action):
+            toolbar.addAction(action)
+        toolbar.addSeparator()
+        overlay_label = QLabel(" Overlay ")
+        overlay_label.setStyleSheet("color: palette(text);")
+        toolbar.addWidget(overlay_label)
         self.charge_selector = QComboBox()
         self.charge_selector.addItems(["Off", "Nonzero", "All"])
         self.charge_selector.setCurrentText(self.charge_mode)
         self.charge_selector.currentTextChanged.connect(self.set_charge_mode)
         toolbar.addWidget(self.charge_selector)
-        toolbar.addSeparator(); toolbar.addAction(self.fit_action); toolbar.addAction(self.validate_action)
+        toolbar.addSeparator()
+        for action in (self.zoom_out_action, self.zoom_in_action, self.fit_action):
+            toolbar.addAction(action)
 
     def _create_parameter_dock(self) -> None:
         self.parameter_panel = ParameterPanel(
@@ -721,17 +882,30 @@ class MainWindow(QMainWindow):
             self.extract_trajectory_frame, self,
         )
         dock = QDockWidget("Physical parameters", self)
+        dock.setWindowTitle("Inspector")
         dock.setObjectName("physical-parameters")
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        dock.setMinimumWidth(300)
+        dock.setMinimumWidth(320)
+        dock.setStyleSheet("""
+            QDockWidget { color: palette(text); font-weight: 600; }
+            QDockWidget::title {
+                background: palette(button);
+                border-left: 1px solid palette(mid);
+                border-bottom: 1px solid palette(mid);
+                padding: 7px 9px;
+                text-align: left;
+            }
+        """)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: palette(window); border: none; }")
         scroll.setWidget(self.parameter_panel)
         dock.setWidget(scroll)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
-    def rebuild_scene(self) -> None:
+    def rebuild_scene(self, *, fit: bool = True) -> None:
         self.charge_items.clear()
         self.trap_items.clear()
         self.scene.clear()
@@ -745,10 +919,18 @@ class MainWindow(QMainWindow):
             self.trap_items.append(item)
         self.rebuild_charge_overlay()
         margin = max(self.document.trap_separation, 1.0)
-        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin))
+        self.content_rect = self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin)
+        # QGraphicsView otherwise locks a fitted scene to the viewport center
+        # because its scroll bars have no range.  A larger navigation rect lets
+        # middle-drag panning work at any zoom, including during playback.
+        pad_x = max(self.content_rect.width() * 5, margin * 8)
+        pad_y = max(self.content_rect.height() * 5, margin * 8)
+        self.scene.setSceneRect(self.content_rect.adjusted(-pad_x, -pad_y, pad_x, pad_y))
         self.parameter_panel.set_document(self.document)
         self.parameter_panel.set_trajectory_mode(self.trajectory_session is not None)
-        self.fit_scene(); self.update_status(); self.update_energy()
+        if fit:
+            self.fit_scene()
+        self.update_status(); self.update_energy()
 
     def refresh_items(self) -> None:
         for item in self.scene.items():
@@ -826,7 +1008,19 @@ class MainWindow(QMainWindow):
 
     def fit_scene(self) -> None:
         self.view.setTransform(QTransform())
-        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        target = getattr(self, "content_rect", self.scene.itemsBoundingRect())
+        self.view.fitInView(target, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def zoom_in(self) -> None:
+        self.view.zoom_by(1.25)
+
+    def zoom_out(self) -> None:
+        self.view.zoom_by(0.8)
+
+    def actual_size(self) -> None:
+        center = self.view.mapToScene(self.view.viewport().rect().center())
+        self.view.setTransform(QTransform())
+        self.view.centerOn(center)
 
     def update_status(self) -> None:
         selected = len([item for item in self.scene.selectedItems() if isinstance(item, TrapItem)])
@@ -1016,7 +1210,7 @@ class MainWindow(QMainWindow):
         self.document = replacement
         self.project_path = None
         if not same_items:
-            self.rebuild_scene()
+            self.rebuild_scene(fit=self.current_trajectory_position is None)
         else:
             for item, trap in zip(self.trap_items, replacement.traps, strict=True):
                 item.prepareGeometryChange()

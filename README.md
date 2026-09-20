@@ -38,7 +38,9 @@ rpy run aci-state-builder
 - Use a persistent right-hand parameter pane for lattice dimensions and spacing,
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.
-- Pan with the scrollbars, zoom with the wheel, and press `0` to fit the lattice.
+- Pan naturally with a middle-button drag, zoom around the pointer with the
+  wheel, use the toolbar for explicit zoom controls, and press `0` to fit the
+  lattice.
 
 Trajectory frame indexes are stored under the user's cache directory rather
 than beside the simulation data. The first opening scans a CSV once; later

@@ -7,6 +7,9 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtTest import QTest
 
 from aci_state_builder.app import MainWindow
 
@@ -47,6 +50,8 @@ class TrajectoryUiTests(unittest.TestCase):
 
             window = MainWindow()
             try:
+                window.show()
+                QApplication.processEvents()
                 window._open_trajectory_path(str(path))
                 self.assertTrue(self._wait_until(lambda: window.current_trajectory_position == 0))
                 items = [id(item) for item in window.trap_items]
@@ -55,6 +60,19 @@ class TrajectoryUiTests(unittest.TestCase):
                 self.assertEqual(items, [id(item) for item in window.trap_items])
                 self.assertEqual(window.playback.slider.value(), 3)
                 self.assertFalse(window.parameter_panel.trajectory_pane.isHidden())
+                horizontal = window.view.horizontalScrollBar()
+                vertical = window.view.verticalScrollBar()
+                before = horizontal.value(), vertical.value()
+                QTest.mousePress(
+                    window.view.viewport(), Qt.MouseButton.MiddleButton,
+                    pos=QPoint(160, 140),
+                )
+                QTest.mouseMove(window.view.viewport(), QPoint(190, 160))
+                QTest.mouseRelease(
+                    window.view.viewport(), Qt.MouseButton.MiddleButton,
+                    pos=QPoint(190, 160),
+                )
+                self.assertNotEqual((horizontal.value(), vertical.value()), before)
             finally:
                 window._leave_trajectory_mode()
                 window.thread_pool.waitForDone(5000)
@@ -63,6 +81,59 @@ class TrajectoryUiTests(unittest.TestCase):
                     os.environ.pop("XDG_CACHE_HOME", None)
                 else:
                     os.environ["XDG_CACHE_HOME"] = previous_cache
+
+    def test_view_zoom_and_middle_button_pan(self) -> None:
+        window = MainWindow()
+        try:
+            window.show()
+            QApplication.processEvents()
+            initial_scale = window.view.transform().m11()
+            window.zoom_in()
+            self.assertAlmostEqual(window.view.transform().m11(), initial_scale * 1.25)
+            window.actual_size()
+            self.assertAlmostEqual(window.view.transform().m11(), 1.0)
+
+            horizontal = window.view.horizontalScrollBar()
+            vertical = window.view.verticalScrollBar()
+            horizontal.setValue((horizontal.minimum() + horizontal.maximum()) // 2)
+            vertical.setValue((vertical.minimum() + vertical.maximum()) // 2)
+            before = horizontal.value(), vertical.value()
+            QTest.mousePress(
+                window.view.viewport(), Qt.MouseButton.MiddleButton,
+                pos=QPoint(160, 140),
+            )
+            self.assertTrue(window.view._middle_panning)
+            QTest.mouseMove(window.view.viewport(), QPoint(185, 155))
+            QTest.mouseRelease(
+                window.view.viewport(), Qt.MouseButton.MiddleButton,
+                pos=QPoint(185, 155),
+            )
+            self.assertFalse(window.view._middle_panning)
+            self.assertNotEqual((horizontal.value(), vertical.value()), before)
+        finally:
+            window.close()
+
+    def test_dark_application_palette_reaches_canvas(self) -> None:
+        original = QApplication.palette()
+        dark = QPalette(original)
+        dark.setColor(QPalette.ColorRole.Window, QColor("#202225"))
+        dark.setColor(QPalette.ColorRole.Base, QColor("#17191b"))
+        dark.setColor(QPalette.ColorRole.AlternateBase, QColor("#282b2f"))
+        dark.setColor(QPalette.ColorRole.Text, QColor("#f1f3f4"))
+        dark.setColor(QPalette.ColorRole.Button, QColor("#30343a"))
+        dark.setColor(QPalette.ColorRole.Mid, QColor("#666c73"))
+        dark.setColor(QPalette.ColorRole.Highlight, QColor("#4d91d8"))
+        dark.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        QApplication.setPalette(dark)
+        window = MainWindow()
+        try:
+            self.assertEqual(
+                window.view.backgroundBrush().color(),
+                dark.color(QPalette.ColorRole.Base),
+            )
+        finally:
+            window.close()
+            QApplication.setPalette(original)
 
 
 if __name__ == "__main__":
