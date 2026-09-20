@@ -43,12 +43,7 @@ def _infer_square_metadata(traps: list[TrapState]) -> dict[str, Any]:
             "lattice_constant": spacing}
 
 
-def read_csv(path: str | Path) -> IceDocument:
-    path = Path(path)
-    try:
-        table = pl.read_csv(path, infer_schema_length=10_000)
-    except Exception as error:
-        raise StateFormatError(f"could not read CSV: {error}") from error
+def document_from_frame(table: pl.DataFrame, *, name: str = "Untitled") -> IceDocument:
     missing = [column for column in REQUIRED_COLUMNS if column not in table.columns]
     if missing:
         raise StateFormatError("missing required columns: " + ", ".join(missing))
@@ -75,8 +70,17 @@ def read_csv(path: str | Path) -> IceDocument:
     nonzero = [value for value in lengths if value > 1e-12]
     return IceDocument(
         traps=traps, trap_separation=2 * float(np.median(nonzero)) if nonzero else 3.0,
-        name=path.stem, source_columns=list(table.columns), **_infer_square_metadata(traps),
+        name=name, source_columns=list(table.columns), **_infer_square_metadata(traps),
     )
+
+
+def read_csv(path: str | Path) -> IceDocument:
+    path = Path(path)
+    try:
+        table = pl.read_csv(path, infer_schema_length=10_000)
+    except Exception as error:
+        raise StateFormatError(f"could not read CSV: {error}") from error
+    return document_from_frame(table, name=path.stem)
 
 
 def to_frame(document: IceDocument, *, canonical: bool = True) -> pl.DataFrame:

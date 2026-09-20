@@ -26,6 +26,10 @@ rpy run aci-state-builder
   or randomize all trap occupancies, from the context-aware sidebar.
 - Undo and redo state changes.
 - Import legacy state CSVs using Polars.
+- Open multi-frame CSV trajectories without loading the whole file, using a
+  reusable external frame index and a user-controlled bounded chunk cache.
+- Scrub or play trajectories, choose frame stride and playback speed, prefetch
+  upcoming frames, and extract the current frame into an editable state.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
 - Save richer, versioned `.aci.json` project files.
 - Display periodic topological charges `q = N_in - N_out` as either nonzero-only
@@ -35,6 +39,12 @@ rpy run aci-state-builder
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.
 - Pan with the scrollbars, zoom with the wheel, and press `0` to fit the lattice.
+
+Trajectory frame indexes are stored under the user's cache directory rather
+than beside the simulation data. The first opening scans a CSV once; later
+openings seek directly to the required frame blocks. The reader, cache, and UI
+are deliberately separated so a native Parquet backend can be added later
+without changing trajectory playback or analysis controls.
 
 ## Tests
 

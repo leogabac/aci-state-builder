@@ -5,3 +5,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# Local simulation fixtures can be large; keep copied trajectories out of Git.
+/examples/*.csv

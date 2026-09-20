@@ -2,23 +2,47 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import math
+import csv
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter, QPainterPath, QPen, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-    QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QHBoxLayout, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QSpinBox, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from .formats import StateFormatError, read_csv, write_csv
+from .formats import StateFormatError, document_from_frame, read_csv, write_csv
 from .energy import EnergyParameters, calculate_energy
 from .geometry import periodic_square, periodic_vertex_charges, periodic_vertex_data
 from .model import IceDocument
 from .presets import SQUARE_CONFIGURATIONS, randomized
 from .validation import validate
+from .trajectory import IndexedCsvTrajectory, TrajectoryFormatError, TrajectorySession
+
+
+class WorkerSignals(QObject):
+    result = Signal(object)
+    error = Signal(str)
+    progress = Signal(int)
+
+
+class Worker(QRunnable):
+    def __init__(self, function) -> None:
+        super().__init__()
+        self.function = function
+        self.signals = WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            result = self.function(self.signals)
+        except Exception as error:
+            self.signals.error.emit(str(error))
+        else:
+            self.signals.result.emit(result)
 
 
 class TrapItem(QGraphicsItem):
@@ -37,30 +61,54 @@ class TrapItem(QGraphicsItem):
         return self.document.traps[self.index]
 
     def boundingRect(self) -> QRectF:
-        half = max(self.document.trap_separation / 2, 0.5)
-        radius = max(self.document.trap_separation * 0.16, 0.12)
-        axis = self.trap.axis[:2]
-        reach_x = abs(axis[0]) * half + radius * 2
-        reach_y = abs(axis[1]) * half + radius * 2
-        return QRectF(-reach_x, -reach_y, 2 * reach_x, 2 * reach_y)
+        # Deliberately generous so imported off-axis displacements remain visible.
+        reach = max(self.document.trap_separation * 0.85, 0.75)
+        if self.trap.displacement is not None:
+            reach = max(reach, float(np.linalg.norm(self.trap.displacement[:2])) * 1.3)
+        return QRectF(-reach, -reach, 2 * reach, 2 * reach)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         del option, widget
-        axis = QPointF(float(self.trap.axis[0]), float(-self.trap.axis[1]))
         half = self.document.trap_separation / 2
-        radius = max(self.document.trap_separation * 0.13, 0.10)
-        first = QPointF(-axis.x() * half, -axis.y() * half)
-        second = QPointF(axis.x() * half, axis.y() * half)
-        occupied = second if self.trap.occupancy > 0 else first
-        color = QColor("#ff9f1c") if self.isSelected() else QColor("#33515f")
-        painter.setPen(QPen(color, max(radius * 0.36, 0.08)))
-        painter.drawLine(first, second)
-        painter.setBrush(QBrush(QColor("#e8eef0")))
-        painter.setPen(QPen(color, max(radius * 0.18, 0.04)))
-        painter.drawEllipse(first, radius, radius)
-        painter.drawEllipse(second, radius, radius)
-        painter.setBrush(QBrush(QColor("#132f3a")))
-        painter.drawEllipse(occupied, radius * 0.70, radius * 0.70)
+        radius = max(self.document.trap_separation * 0.22, 0.14)
+        waist = radius * 0.40
+        angle = math.degrees(math.atan2(-self.trap.axis[1], self.trap.axis[0]))
+
+        # A compact double-well silhouette: two flat-sided elliptical basins
+        # joined by a narrow waist, close to the lithographic peanut geometry.
+        peanut = QPainterPath(QPointF(-half - radius * 0.72, 0))
+        peanut.cubicTo(-half - radius * 0.72, -radius * 0.78,
+                       -half - radius * 0.18, -radius, -half + radius * 0.30, -radius)
+        peanut.cubicTo(-half + radius * 0.82, -radius, -waist, -waist, 0, -waist)
+        peanut.cubicTo(waist, -waist, half - radius * 0.82, -radius,
+                       half - radius * 0.30, -radius)
+        peanut.cubicTo(half + radius * 0.18, -radius, half + radius * 0.72, -radius * 0.78,
+                       half + radius * 0.72, 0)
+        peanut.cubicTo(half + radius * 0.72, radius * 0.78,
+                       half + radius * 0.18, radius, half - radius * 0.30, radius)
+        peanut.cubicTo(half - radius * 0.82, radius, waist, waist, 0, waist)
+        peanut.cubicTo(-waist, waist, -half + radius * 0.82, radius,
+                       -half + radius * 0.30, radius)
+        peanut.cubicTo(-half - radius * 0.18, radius,
+                       -half - radius * 0.72, radius * 0.78, -half - radius * 0.72, 0)
+        peanut.closeSubpath()
+
+        outline = QColor("#e78632") if self.isSelected() else QColor("#52717c")
+        painter.save()
+        painter.rotate(angle)
+        painter.setPen(QPen(outline, max(radius * 0.13, 0.035)))
+        painter.setBrush(QBrush(QColor("#dce7e8")))
+        painter.drawPath(peanut)
+        painter.setPen(QPen(QColor(90, 119, 128, 105), max(radius * 0.07, 0.025), Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(0, -waist * 0.72), QPointF(0, waist * 0.72))
+        painter.restore()
+
+        displacement = self.trap.displayed_displacement(self.document.trap_separation)
+        occupied = QPointF(float(displacement[0]), float(-displacement[1]))
+        particle_radius = radius * 0.62
+        painter.setPen(QPen(QColor("#f7fbfc"), max(radius * 0.11, 0.035)))
+        painter.setBrush(QBrush(QColor("#173b47")))
+        painter.drawEllipse(occupied, particle_radius, particle_radius)
 
     def mousePressEvent(self, event) -> None:
         self._press_position = event.scenePos()
@@ -271,10 +319,143 @@ class FoldablePane(QWidget):
         self.body.setVisible(expanded)
 
 
+class PlaybackBar(QWidget):
+    def __init__(self, seek_callback, play_callback, parent=None) -> None:
+        super().__init__(parent)
+        self.seek_callback = seek_callback
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(6)
+        self.first = QPushButton("|◀")
+        self.previous = QPushButton("◀")
+        self.play = QPushButton("▶")
+        self.next = QPushButton("▶")
+        self.last = QPushButton("▶|")
+        for button in (self.first, self.previous, self.play, self.next, self.last):
+            button.setFixedWidth(38)
+            layout.addWidget(button)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        layout.addWidget(self.slider, 1)
+        self.position = QLabel("Frame – / –")
+        self.position.setMinimumWidth(150)
+        layout.addWidget(self.position)
+        self.time = QLabel()
+        self.time.setMinimumWidth(90)
+        layout.addWidget(self.time)
+        self.setVisible(False)
+
+        self.first.clicked.connect(lambda: self.seek_callback(0))
+        self.previous.clicked.connect(lambda: self.seek_callback(self.slider.value() - 1))
+        self.play.clicked.connect(play_callback)
+        self.next.clicked.connect(lambda: self.seek_callback(self.slider.value() + 1))
+        self.last.clicked.connect(lambda: self.seek_callback(self.slider.maximum()))
+        self.slider.valueChanged.connect(self.seek_callback)
+
+    def configure(self, frame_count: int) -> None:
+        self.slider.setRange(0, max(frame_count - 1, 0))
+        self.setVisible(True)
+
+    def show_position(self, position: int, frame_value: str, time_value: str | None) -> None:
+        self.slider.blockSignals(True)
+        self.slider.setValue(position)
+        self.slider.blockSignals(False)
+        self.position.setText(f"Frame {frame_value}  ({position + 1}/{self.slider.maximum() + 1})")
+        self.time.setText("" if time_value is None else f"t = {time_value}")
+
+    def set_playing(self, playing: bool) -> None:
+        self.play.setText("❚❚" if playing else "▶")
+        self.play.setToolTip("Pause" if playing else "Play")
+
+
+class TrajectoryPane(FoldablePane):
+    def __init__(self, settings_callback, extract_callback, parent=None) -> None:
+        super().__init__("Trajectory", parent=parent)
+        self.settings_callback = settings_callback
+        form = QFormLayout(self.body)
+        self.file = QLabel("No trajectory")
+        self.file.setWordWrap(True)
+        self.summary = QLabel()
+        self.current = QLabel()
+        self.loaded = QLabel()
+        self.chunk_size = QSpinBox(); self.chunk_size.setRange(8, 4096); self.chunk_size.setValue(256)
+        self.cached_chunks = QSpinBox(); self.cached_chunks.setRange(1, 5); self.cached_chunks.setValue(3)
+        self.prefetch = QCheckBox("Load the next chunk while viewing")
+        self.prefetch.setChecked(True)
+        self.stride = QSpinBox(); self.stride.setRange(1, 100_000); self.stride.setValue(1)
+        self.fps = QSpinBox(); self.fps.setRange(1, 120); self.fps.setValue(24)
+        self.loop = QCheckBox("Loop playback")
+        self.diagnostics = QComboBox(); self.diagnostics.addItems(["When paused", "Every frame", "Off"])
+        self.memory = QLabel()
+        self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setVisible(False)
+        self.extract = QPushButton("Extract current frame as state")
+        form.addRow("File", self.file)
+        form.addRow("Contents", self.summary)
+        form.addRow("Current", self.current)
+        form.addRow("Loaded", self.loaded)
+        form.addRow("Frames per chunk", self.chunk_size)
+        form.addRow("Chunks in memory", self.cached_chunks)
+        form.addRow("Memory estimate", self.memory)
+        form.addRow(self.prefetch)
+        form.addRow("Frame stride", self.stride)
+        form.addRow("Playback (fps)", self.fps)
+        form.addRow(self.loop)
+        form.addRow("Diagnostics", self.diagnostics)
+        form.addRow(self.progress)
+        form.addRow(self.extract)
+        self.metadata = None
+        for box in (self.chunk_size, self.cached_chunks):
+            box.valueChanged.connect(self._settings_changed)
+        self.extract.clicked.connect(extract_callback)
+        self.setVisible(False)
+
+    def set_metadata(self, metadata) -> None:
+        self.metadata = metadata
+        particles = metadata.particles_per_frame
+        particle_text = "variable" if particles is None else f"{particles:,}"
+        self.file.setText(metadata.path.name)
+        self.file.setToolTip(str(metadata.path))
+        self.summary.setText(f"{metadata.frame_count:,} frames · {particle_text} particles/frame")
+        self.setVisible(True)
+        self._update_memory()
+
+    def set_current(self, text: str) -> None:
+        self.current.setText(text)
+
+    def set_loaded_range(self, loaded: tuple[int, int] | None) -> None:
+        self.loaded.setText("–" if loaded is None else f"{loaded[0] + 1:,}–{loaded[1] + 1:,}")
+
+    def show_progress(self, percent: int, text: str = "Indexing…") -> None:
+        self.setVisible(True)
+        self.file.setText(text)
+        self.progress.setVisible(True)
+        self.progress.setValue(percent)
+
+    def hide_progress(self) -> None:
+        self.progress.setVisible(False)
+
+    def _settings_changed(self) -> None:
+        self._update_memory()
+        self.settings_callback()
+
+    def _update_memory(self) -> None:
+        if self.metadata is None or self.metadata.particles_per_frame is None:
+            self.memory.setText("depends on frame size")
+            return
+        # Numeric CSV columns normally become eight-byte values in Polars.
+        cached_frames = min(
+            self.metadata.frame_count,
+            self.chunk_size.value() * self.cached_chunks.value(),
+        )
+        mib = (self.metadata.particles_per_frame * len(self.metadata.columns)
+               * 8 * cached_frames / 2**20)
+        self.memory.setText(f"≈ {mib:.0f} MiB maximum")
+
+
 class ParameterPanel(QWidget):
     def __init__(
         self, document: IceDocument, change_callback, lattice_callback,
-        configuration_callback, parent=None,
+        configuration_callback, trajectory_settings_callback,
+        extract_frame_callback, parent=None,
     ) -> None:
         super().__init__(parent)
         self.change_callback = change_callback
@@ -283,6 +464,11 @@ class ParameterPanel(QWidget):
         self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
+
+        self.trajectory_pane = TrajectoryPane(
+            trajectory_settings_callback, extract_frame_callback, self,
+        )
+        layout.addWidget(self.trajectory_pane)
 
         self.lattice_pane = FoldablePane("Lattice")
         lattice_form = QFormLayout(self.lattice_pane.body)
@@ -395,6 +581,7 @@ class ParameterPanel(QWidget):
         for box, value in values:
             box.setValue(value)
         generated_square = document.geometry == "square" and document.nx is not None and document.ny is not None
+        self._generated_square = generated_square
         self.apply_lattice.setEnabled(generated_square)
         selected = self.configuration.currentText()
         self.configuration.clear()
@@ -419,6 +606,11 @@ class ParameterPanel(QWidget):
             self.configuration.setCurrentText(selected)
         self._loading = False
         self._update_box_size()
+
+    def set_trajectory_mode(self, enabled: bool) -> None:
+        self.apply_lattice.setEnabled(not enabled and self._generated_square)
+        self.apply_configuration.setEnabled(not enabled)
+        self.configuration.setEnabled(not enabled)
 
     def _update_box_size(self) -> None:
         self.box_size.setText(
@@ -462,14 +654,27 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ACI State Builder"); self.resize(1180, 820)
         self.document = periodic_square(10, 10, 8.374011537, 3.0)
         self.project_path: Path | None = None
+        self.trajectory_session: TrajectorySession | None = None
+        self.trajectory_token = 0
+        self.requested_frame = 0
+        self.current_trajectory_position: int | None = None
+        self.loading_chunks: set[int] = set()
+        self.workers: set[Worker] = set()
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(2)
         self.charge_mode = "Nonzero"
         self.charge_items: list[ChargeItem] = []
+        self.trap_items: list[TrapItem] = []
         self.undo_stack = QUndoStack(self)
         self.scene = QGraphicsScene(self); self.scene.selectionChanged.connect(self.update_status)
         self.view = IceView(self.scene); self.status = QLabel()
         container = QWidget(); layout = QVBoxLayout(container); layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.view); layout.addWidget(self.status)
+        self.playback = PlaybackBar(self.seek_trajectory, self.toggle_playback, self)
+        layout.addWidget(self.view); layout.addWidget(self.playback); layout.addWidget(self.status)
         self.setCentralWidget(container)
+        self.play_timer = QTimer(self); self.play_timer.timeout.connect(self.advance_trajectory)
+        self.seek_timer = QTimer(self); self.seek_timer.setSingleShot(True)
+        self.seek_timer.timeout.connect(self._request_pending_frame)
         self._create_actions(); self._create_toolbar(); self._create_parameter_dock(); self.rebuild_scene()
 
     def _action(self, text: str, callback, shortcut=None) -> QAction:
@@ -481,7 +686,8 @@ class MainWindow(QMainWindow):
         self.new_action = self._action("New", self.new_document, QKeySequence.StandardKey.New)
         self.open_action = self._action("Open project", self.open_project, QKeySequence.StandardKey.Open)
         self.save_action = self._action("Save project", self.save_project, QKeySequence.StandardKey.Save)
-        self.import_action = self._action("Import CSV", self.import_csv)
+        self.import_action = self._action("Import state", self.import_csv)
+        self.trajectory_action = self._action("Open trajectory", self.open_trajectory)
         self.export_action = self._action("Export CSV", self.export_csv)
         self.flip_action = self._action("Flip selected", self.flip_selected, QKeySequence("F"))
         self.fit_action = self._action("Fit", self.fit_scene, QKeySequence("0"))
@@ -490,10 +696,13 @@ class MainWindow(QMainWindow):
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.redo_action = self.undo_stack.createRedoAction(self, "Redo")
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.play_action = self._action("Play / pause trajectory", self.toggle_playback, QKeySequence("Space"))
+        self.addAction(self.play_action)
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("Main", self); toolbar.setMovable(False); self.addToolBar(toolbar)
         for action in (self.new_action, self.open_action, self.save_action, self.import_action,
+                       self.trajectory_action,
                        self.export_action, self.undo_action, self.redo_action, self.flip_action):
             toolbar.addAction(action)
         toolbar.addSeparator()
@@ -508,7 +717,8 @@ class MainWindow(QMainWindow):
     def _create_parameter_dock(self) -> None:
         self.parameter_panel = ParameterPanel(
             self.document, self.set_energy_parameters, self.apply_lattice_parameters,
-            self.apply_configuration, self,
+            self.apply_configuration, self.trajectory_settings_changed,
+            self.extract_trajectory_frame, self,
         )
         dock = QDockWidget("Physical parameters", self)
         dock.setObjectName("physical-parameters")
@@ -523,16 +733,21 @@ class MainWindow(QMainWindow):
 
     def rebuild_scene(self) -> None:
         self.charge_items.clear()
+        self.trap_items.clear()
         self.scene.clear()
         for index, trap in enumerate(self.document.traps):
             item = TrapItem(index, self.document, self.flip_indices)
             item.setPos(float(trap.center[0]), float(-trap.center[1]))
             item.setToolTip(f"id {trap.id} | center ({trap.center[0]:g}, {trap.center[1]:g})")
+            if self.trajectory_session is not None:
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.scene.addItem(item)
+            self.trap_items.append(item)
         self.rebuild_charge_overlay()
         margin = max(self.document.trap_separation, 1.0)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin))
         self.parameter_panel.set_document(self.document)
+        self.parameter_panel.set_trajectory_mode(self.trajectory_session is not None)
         self.fit_scene(); self.update_status(); self.update_energy()
 
     def refresh_items(self) -> None:
@@ -632,6 +847,8 @@ class MainWindow(QMainWindow):
         self.undo_stack.push(StateCommand(self, before, after, text))
 
     def flip_indices(self, indices: list[int]) -> None:
+        if self.trajectory_session is not None:
+            return
         self.push_state_change(
             lambda: self.document.flip_indices(indices),
             "Flip trap" if len(indices) == 1 else "Flip traps",
@@ -642,6 +859,8 @@ class MainWindow(QMainWindow):
         if indices: self.flip_indices(indices)
 
     def apply_configuration(self, name: str) -> None:
+        if self.trajectory_session is not None:
+            return
         try:
             function = (
                 SQUARE_CONFIGURATIONS[name]
@@ -655,7 +874,262 @@ class MainWindow(QMainWindow):
         except ValueError as error:
             QMessageBox.warning(self, "Configuration unavailable", str(error))
 
+    def _run_worker(self, function, on_result, on_error=None, on_progress=None) -> None:
+        worker = Worker(function)
+        self.workers.add(worker)
+
+        def finish(result) -> None:
+            self.workers.discard(worker)
+            on_result(result)
+
+        def fail(message: str) -> None:
+            self.workers.discard(worker)
+            if on_error is not None:
+                on_error(message)
+            else:
+                QMessageBox.critical(self, "Background task failed", message)
+
+        worker.signals.result.connect(finish)
+        worker.signals.error.connect(fail)
+        if on_progress is not None:
+            worker.signals.progress.connect(on_progress)
+        self.thread_pool.start(worker)
+
+    def open_trajectory(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Open trajectory", "", "CSV trajectories (*.csv)"
+        )
+        if not filename:
+            return
+        self._open_trajectory_path(filename)
+
+    def _open_trajectory_path(self, filename: str) -> None:
+        self._leave_trajectory_mode()
+        self.trajectory_token += 1
+        token = self.trajectory_token
+        pane = self.parameter_panel.trajectory_pane
+        pane.show_progress(0, f"Indexing {Path(filename).name}…")
+        self.status.setText("  Building trajectory frame index…")
+
+        def construct(signals):
+            source = IndexedCsvTrajectory(
+                filename,
+                progress=lambda done, total: signals.progress.emit(
+                    100 if total == 0 else int(done * 100 / total)
+                ),
+            )
+            return token, source
+
+        def opened(result) -> None:
+            result_token, source = result
+            if result_token != self.trajectory_token:
+                return
+            self.trajectory_session = TrajectorySession(
+                source, pane.chunk_size.value(), pane.cached_chunks.value()
+            )
+            self.requested_frame = 0
+            self.current_trajectory_position = None
+            pane.hide_progress(); pane.set_metadata(source.metadata)
+            self.playback.configure(source.metadata.frame_count)
+            self.flip_action.setEnabled(False)
+            self.undo_action.setEnabled(False); self.redo_action.setEnabled(False)
+            self.parameter_panel.set_trajectory_mode(True)
+            self.request_trajectory_frame(0)
+
+        def failed(message: str) -> None:
+            pane.hide_progress(); pane.setVisible(False)
+            QMessageBox.critical(self, "Could not open trajectory", message)
+            self.update_status()
+
+        self._run_worker(construct, opened, failed, pane.progress.setValue)
+
+    def seek_trajectory(self, position: int) -> None:
+        if self.trajectory_session is None:
+            return
+        maximum = self.trajectory_session.source.metadata.frame_count - 1
+        self.requested_frame = min(max(int(position), 0), maximum)
+        self.seek_timer.start(60)
+
+    def _request_pending_frame(self) -> None:
+        self.request_trajectory_frame(self.requested_frame)
+
+    def request_trajectory_frame(self, position: int) -> None:
+        session = self.trajectory_session
+        if session is None:
+            return
+        maximum = session.source.metadata.frame_count - 1
+        position = min(max(position, 0), maximum)
+        self.requested_frame = position
+        table = session.cached_frame(position)
+        if table is not None:
+            self._display_trajectory_frame(position, table)
+            return
+        start = session.chunk_start(position)
+        if start in self.loading_chunks:
+            return
+        self.loading_chunks.add(start)
+        token = self.trajectory_token
+        self.status.setText(f"  Loading trajectory frames {start + 1:,}…")
+
+        def load(signals):
+            del signals
+            return token, start, session.load_chunk(start)
+
+        def loaded(result) -> None:
+            result_token, loaded_start, chunk = result
+            self.loading_chunks.discard(loaded_start)
+            if result_token != self.trajectory_token or self.trajectory_session is not session:
+                return
+            session.store_chunk(chunk)
+            self.parameter_panel.trajectory_pane.set_loaded_range(session.loaded_range())
+            table = session.cached_frame(self.requested_frame)
+            if table is not None:
+                self._display_trajectory_frame(self.requested_frame, table)
+
+        def failed(message: str) -> None:
+            self.loading_chunks.discard(start)
+            if token == self.trajectory_token:
+                self.pause_playback()
+                QMessageBox.critical(self, "Could not load trajectory frames", message)
+
+        self._run_worker(load, loaded, failed)
+
+    def _display_trajectory_frame(self, position: int, table) -> None:
+        session = self.trajectory_session
+        if session is None:
+            return
+        try:
+            replacement = document_from_frame(table, name=session.source.path.stem)
+        except StateFormatError as error:
+            self.pause_playback()
+            QMessageBox.critical(self, "Invalid trajectory frame", str(error))
+            return
+        replacement.energy_parameters = dict(self.document.energy_parameters)
+        replacement.trap_height_pn_nm = self.document.trap_height_pn_nm
+        replacement.trap_stiffness_pn_per_nm = self.document.trap_stiffness_pn_per_nm
+        if self.current_trajectory_position is not None:
+            replacement.trap_separation = self.document.trap_separation
+        same_items = (
+            len(replacement.traps) == len(self.trap_items)
+            and all(item.trap.id == trap.id for item, trap in zip(self.trap_items, replacement.traps, strict=True))
+        )
+        self.document = replacement
+        self.project_path = None
+        if not same_items:
+            self.rebuild_scene()
+        else:
+            for item, trap in zip(self.trap_items, replacement.traps, strict=True):
+                item.prepareGeometryChange()
+                item.document = replacement
+                item.setPos(float(trap.center[0]), float(-trap.center[1]))
+                item.update()
+            self.rebuild_charge_overlay()
+            self.update_status()
+        self.current_trajectory_position = position
+        entry = session.source.metadata.frames[position]
+        self.playback.show_position(position, entry.value, entry.time)
+        current_text = f"frame {entry.value}"
+        if entry.time is not None:
+            current_text += f" · t={entry.time}"
+        self.parameter_panel.trajectory_pane.set_current(current_text)
+        diagnostics = self.parameter_panel.trajectory_pane.diagnostics.currentText()
+        if diagnostics == "Every frame" or (diagnostics == "When paused" and not self.play_timer.isActive()):
+            self.update_energy()
+        elif diagnostics == "Off":
+            self.parameter_panel.energy_result.setText("Energy disabled during trajectory viewing")
+        self._prefetch_next_chunk(position)
+
+    def _prefetch_next_chunk(self, position: int) -> None:
+        session = self.trajectory_session
+        pane = self.parameter_panel.trajectory_pane
+        if session is None or not pane.prefetch.isChecked():
+            return
+        start = session.chunk_start(position) + session.chunk_size
+        if start >= session.source.metadata.frame_count or session.has_chunk(start) or start in self.loading_chunks:
+            return
+        self.loading_chunks.add(start)
+        token = self.trajectory_token
+
+        def load(signals):
+            del signals
+            return token, start, session.load_chunk(start)
+
+        def loaded(result) -> None:
+            result_token, loaded_start, chunk = result
+            self.loading_chunks.discard(loaded_start)
+            if result_token == self.trajectory_token and self.trajectory_session is session:
+                session.store_chunk(chunk)
+                pane.set_loaded_range(session.loaded_range())
+
+        self._run_worker(load, loaded, lambda message: self.loading_chunks.discard(start))
+
+    def trajectory_settings_changed(self) -> None:
+        session = self.trajectory_session
+        if session is None:
+            return
+        pane = self.parameter_panel.trajectory_pane
+        # In-flight chunks were requested with the old boundaries.  Let those
+        # reads finish harmlessly, but ignore them and start a fresh generation.
+        self.trajectory_token += 1
+        self.loading_chunks.clear()
+        session.configure(pane.chunk_size.value(), pane.cached_chunks.value())
+        pane.set_loaded_range(None)
+        self.request_trajectory_frame(self.requested_frame)
+
+    def toggle_playback(self) -> None:
+        if self.trajectory_session is None:
+            return
+        if self.play_timer.isActive():
+            self.pause_playback()
+        else:
+            fps = self.parameter_panel.trajectory_pane.fps.value()
+            self.play_timer.start(max(1, round(1000 / fps)))
+            self.playback.set_playing(True)
+
+    def pause_playback(self) -> None:
+        was_playing = self.play_timer.isActive()
+        self.play_timer.stop(); self.playback.set_playing(False)
+        if was_playing and self.trajectory_session is not None:
+            if self.parameter_panel.trajectory_pane.diagnostics.currentText() == "When paused":
+                self.update_energy()
+
+    def advance_trajectory(self) -> None:
+        session = self.trajectory_session
+        if session is None or self.current_trajectory_position != self.requested_frame:
+            return
+        pane = self.parameter_panel.trajectory_pane
+        position = self.requested_frame + pane.stride.value()
+        if position >= session.source.metadata.frame_count:
+            if pane.loop.isChecked():
+                position = 0
+            else:
+                self.pause_playback()
+                return
+        self.request_trajectory_frame(position)
+
+    def extract_trajectory_frame(self) -> None:
+        if self.trajectory_session is None or self.current_trajectory_position is None:
+            return
+        frame_value = self.trajectory_session.source.metadata.frames[self.current_trajectory_position].value
+        document = IceDocument.from_dict(self.document.to_dict())
+        document.name = f"{document.name}-frame-{frame_value}"
+        self.set_document(document)
+
+    def _leave_trajectory_mode(self) -> None:
+        self.pause_playback()
+        self.trajectory_token += 1
+        self.trajectory_session = None
+        self.current_trajectory_position = None
+        self.loading_chunks.clear()
+        self.playback.setVisible(False)
+        if hasattr(self, "parameter_panel"):
+            self.parameter_panel.trajectory_pane.setVisible(False)
+            self.parameter_panel.set_trajectory_mode(False)
+        if hasattr(self, "flip_action"):
+            self.flip_action.setEnabled(True)
+
     def set_document(self, document: IceDocument, path: Path | None = None) -> None:
+        self._leave_trajectory_mode()
         self.document, self.project_path = document, path
         self.undo_stack.clear(); self.rebuild_scene()
 
@@ -678,6 +1152,14 @@ class MainWindow(QMainWindow):
     def import_csv(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Import state CSV", "", "CSV files (*.csv)")
         if not filename: return
+        try:
+            with Path(filename).open("r", encoding="utf-8-sig", newline="") as stream:
+                columns = next(csv.reader([stream.readline()]))
+        except (OSError, UnicodeError, csv.Error, StopIteration) as error:
+            QMessageBox.critical(self, "Could not import state", str(error)); return
+        if "frame" in columns:
+            self._open_trajectory_path(filename)
+            return
         try: document = read_csv(filename)
         except StateFormatError as error:
             QMessageBox.critical(self, "Could not import state", str(error)); return

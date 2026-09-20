@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from aci_state_builder.formats import StateFormatError, read_csv, to_frame, write_csv
+from aci_state_builder.formats import StateFormatError, document_from_frame, read_csv, to_frame, write_csv
 from aci_state_builder.energy import (
     EnergyParameters, calculate_energy, dipole_prefactor_pn_nm_um3,
     geometric_dipole_sum_pbc,
@@ -15,6 +15,7 @@ from aci_state_builder.presets import (
     SQUARE_CONFIGURATIONS, four_in_four_out, randomized, two_in_two_out,
 )
 from aci_state_builder.validation import validate
+from aci_state_builder.trajectory import IndexedCsvTrajectory, TrajectoryFormatError, TrajectorySession
 
 
 WORKSPACE = Path(__file__).resolve().parents[2]
@@ -118,6 +119,63 @@ class FormatTests(unittest.TestCase):
         loaded = read_csv(fixture)
         expected = periodic_square(10, 10, loaded.lattice_constant, loaded.trap_separation)
         np.testing.assert_array_equal(loaded.occupancies(), four_in_four_out(expected))
+
+
+class TrajectoryTests(unittest.TestCase):
+    @staticmethod
+    def _write_trajectory(path: Path, frames=(10, 20, 40), particles=2) -> None:
+        lines = ["frame,id,x,y,z,dx,dy,dz,t,cx,cy,cz"]
+        for frame_index, frame in enumerate(frames):
+            for particle in range(particles):
+                sign = 1 if (frame_index + particle) % 2 == 0 else -1
+                lines.append(
+                    f"{frame},{particle},{particle * 4},0,0,{sign},0,0,"
+                    f"{frame_index * .5},{sign * .5},0,0"
+                )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_index_and_chunk_nonconsecutive_frame_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "trajectory.csv"
+            self._write_trajectory(path)
+            source = IndexedCsvTrajectory(path, cache_directory=root / "cache")
+            self.assertEqual(source.metadata.frame_count, 3)
+            self.assertEqual(source.metadata.particles_per_frame, 2)
+            self.assertEqual([entry.value for entry in source.metadata.frames], ["10", "20", "40"])
+            self.assertEqual([entry.time for entry in source.metadata.frames], ["0.0", "0.5", "1.0"])
+
+            chunk = source.load_chunk(1, 2)
+            self.assertEqual(chunk.count, 2)
+            self.assertEqual(chunk.frame(1).get_column("frame").unique().to_list(), [20])
+            document = document_from_frame(chunk.frame(2), name="trajectory")
+            self.assertEqual(document.name, "trajectory")
+            self.assertEqual(document.traps[0].occupancy, 1)
+
+    def test_session_cache_is_bounded_and_reconfigurable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "trajectory.csv"
+            self._write_trajectory(path, frames=range(8), particles=1)
+            session = TrajectorySession(
+                IndexedCsvTrajectory(path, cache_directory=root / "cache"),
+                chunk_size=2, max_chunks=2,
+            )
+            for start in (0, 2, 4):
+                session.store_chunk(session.load_chunk(start))
+            self.assertIsNone(session.cached_frame(0))
+            self.assertIsNotNone(session.cached_frame(4))
+            self.assertEqual(session.loaded_range(), (2, 5))
+            session.configure(4, 1)
+            self.assertIsNone(session.cached_frame(4))
+
+    def test_rejects_noncontiguous_frame_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "trajectory.csv"
+            self._write_trajectory(path, frames=(0, 1, 0), particles=1)
+            with self.assertRaisesRegex(TrajectoryFormatError, "contiguous blocks"):
+                IndexedCsvTrajectory(path, cache_directory=root / "cache")
 
 
 class EnergyTests(unittest.TestCase):
