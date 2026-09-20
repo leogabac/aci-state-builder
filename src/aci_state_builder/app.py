@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 import math
@@ -11,7 +12,7 @@ from PySide6.QtGui import QAction, QColor, QBrush, QFont, QKeySequence, QPainter
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
-    QFrame, QHBoxLayout, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QFrame, QHBoxLayout, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
     QScrollArea, QSizePolicy, QSlider, QSpinBox, QStyle, QToolBar, QToolButton,
     QVBoxLayout, QWidget,
 )
@@ -47,12 +48,16 @@ class Worker(QRunnable):
 
 
 class TrapItem(QGraphicsItem):
-    def __init__(self, index: int, document: IceDocument, flip_callback) -> None:
+    def __init__(self, index: int, document: IceDocument, flip_callback, inspect_callback) -> None:
         super().__init__()
         self.index = index
         self.document = document
         self.flip_callback = flip_callback
+        self.inspect_callback = inspect_callback
         self._press_position: QPointF | None = None
+        self.show_body = True
+        self.show_particle = True
+        self.show_id = False
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setAcceptHoverEvents(True)
         self.setZValue(1)
@@ -99,23 +104,43 @@ class TrapItem(QGraphicsItem):
             palette.color(QPalette.ColorRole.Highlight)
             if self.isSelected() else palette.color(QPalette.ColorRole.Mid)
         )
-        painter.save()
-        painter.rotate(angle)
-        painter.setPen(QPen(outline, max(radius * 0.13, 0.035)))
-        painter.setBrush(QBrush(palette.color(QPalette.ColorRole.AlternateBase)))
-        painter.drawPath(peanut)
-        barrier = palette.color(QPalette.ColorRole.Mid)
-        barrier.setAlpha(135)
-        painter.setPen(QPen(barrier, max(radius * 0.07, 0.025), Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(0, -waist * 0.72), QPointF(0, waist * 0.72))
-        painter.restore()
+        if self.show_body:
+            painter.save()
+            painter.rotate(angle)
+            painter.setPen(QPen(outline, max(radius * 0.13, 0.035)))
+            painter.setBrush(QBrush(palette.color(QPalette.ColorRole.AlternateBase)))
+            painter.drawPath(peanut)
+            barrier = palette.color(QPalette.ColorRole.Mid)
+            barrier.setAlpha(135)
+            painter.setPen(QPen(barrier, max(radius * 0.07, 0.025), Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(0, -waist * 0.72), QPointF(0, waist * 0.72))
+            painter.restore()
 
         displacement = self.trap.displayed_displacement(self.document.trap_separation)
         occupied = QPointF(float(displacement[0]), float(-displacement[1]))
         particle_radius = radius * 0.62
-        painter.setPen(QPen(palette.color(QPalette.ColorRole.Base), max(radius * 0.11, 0.035)))
-        painter.setBrush(QBrush(palette.color(QPalette.ColorRole.Text)))
-        painter.drawEllipse(occupied, particle_radius, particle_radius)
+        if self.show_particle:
+            painter.setPen(QPen(palette.color(QPalette.ColorRole.Base), max(radius * 0.11, 0.035)))
+            painter.setBrush(QBrush(palette.color(QPalette.ColorRole.Text)))
+            painter.drawEllipse(occupied, particle_radius, particle_radius)
+        if self.show_id:
+            transform = painter.worldTransform()
+            pixels_per_unit = math.hypot(transform.m11(), transform.m12())
+            if self.document.trap_separation * pixels_per_unit >= 34:
+                anchor = transform.map(occupied)
+                painter.save(); painter.resetTransform()
+                font = QFont(painter.font()); font.setPixelSize(11); font.setBold(True)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                label = str(self.trap.id)
+                text_width = metrics.horizontalAdvance(label)
+                badge = QRectF(anchor.x() + 7, anchor.y() - 16, text_width + 8, 16)
+                background = palette.color(QPalette.ColorRole.Base); background.setAlpha(225)
+                painter.setPen(QPen(palette.color(QPalette.ColorRole.Mid), 1))
+                painter.setBrush(QBrush(background)); painter.drawRoundedRect(badge, 3, 3)
+                painter.setPen(QPen(palette.color(QPalette.ColorRole.Text)))
+                painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+                painter.restore()
 
     def mousePressEvent(self, event) -> None:
         self._press_position = event.scenePos()
@@ -128,8 +153,12 @@ class TrapItem(QGraphicsItem):
         modifiers = event.modifiers()
         super().mouseReleaseEvent(event)
         selecting = modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier)
-        if not moved and not selecting:
+        if event.button() == Qt.MouseButton.LeftButton and not moved and not selecting:
             self.flip_callback([self.index])
+
+    def contextMenuEvent(self, event) -> None:
+        self.inspect_callback(self.index, event.screenPos())
+        event.accept()
 
 
 class ChargeItem(QGraphicsItem):
@@ -186,16 +215,140 @@ class ChargeItem(QGraphicsItem):
         painter.restore()
 
 
+@dataclass(frozen=True)
+class VisualSnapshot:
+    position: int
+    frame_value: str
+    ids: tuple[int, ...]
+    positions: np.ndarray
+    occupancies: np.ndarray
+
+
+class BoundaryItem(QGraphicsItem):
+    def __init__(self, rect: QRectF, width: float) -> None:
+        super().__init__()
+        self.rect = rect
+        self.width = width
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(-2)
+
+    def boundingRect(self) -> QRectF:
+        return self.rect.adjusted(-self.width, -self.width, self.width, self.width)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        del option, widget
+        color = QApplication.palette().color(QPalette.ColorRole.Highlight)
+        color.setAlpha(150)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(color, self.width, Qt.PenStyle.DashLine))
+        painter.drawRect(self.rect)
+
+
+class ComparisonItem(QGraphicsItem):
+    def __init__(self, first: VisualSnapshot, second: VisualSnapshot, width: float) -> None:
+        super().__init__()
+        self.first = first
+        self.second = second
+        self.width = width
+        points = np.vstack((first.positions, second.positions))
+        minimum, maximum = points.min(axis=0), points.max(axis=0)
+        margin = max(width * 8, 0.5)
+        self.rect = QRectF(
+            float(minimum[0] - margin), float(minimum[1] - margin),
+            float(maximum[0] - minimum[0] + 2 * margin),
+            float(maximum[1] - minimum[1] + 2 * margin),
+        )
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(4)
+
+    def boundingRect(self) -> QRectF:
+        return self.rect
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        del option, widget
+        palette = QApplication.palette()
+        movement = palette.color(QPalette.ColorRole.Highlight)
+        movement.setAlpha(190)
+        painter.setPen(QPen(movement, self.width))
+        arrow_size = self.width * 4
+        for start, end in zip(self.first.positions, self.second.positions, strict=True):
+            delta = end - start
+            length = float(np.linalg.norm(delta))
+            if length <= self.width:
+                continue
+            a = QPointF(float(start[0]), float(start[1]))
+            b = QPointF(float(end[0]), float(end[1]))
+            painter.drawLine(a, b)
+            unit = delta / length
+            normal = np.array([-unit[1], unit[0]])
+            left = end - unit * arrow_size + normal * arrow_size * 0.45
+            right = end - unit * arrow_size - normal * arrow_size * 0.45
+            head = QPainterPath(b)
+            head.lineTo(QPointF(float(left[0]), float(left[1])))
+            head.lineTo(QPointF(float(right[0]), float(right[1]))); head.closeSubpath()
+            painter.fillPath(head, movement)
+
+        flip_color = QColor("#f29e38")
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(flip_color, self.width * 1.5))
+        radius = self.width * 5
+        changed = self.first.occupancies != self.second.occupancies
+        for point in self.second.positions[changed]:
+            painter.drawEllipse(QPointF(float(point[0]), float(point[1])), radius, radius)
+
+
+class TrailItem(QGraphicsItem):
+    def __init__(self, positions: np.ndarray, width: float) -> None:
+        super().__init__()
+        self.positions = positions
+        self.width = width
+        flattened = positions.reshape(-1, 2)
+        minimum, maximum = flattened.min(axis=0), flattened.max(axis=0)
+        margin = max(width * 2, 0.25)
+        self.rect = QRectF(
+            float(minimum[0] - margin), float(minimum[1] - margin),
+            float(maximum[0] - minimum[0] + 2 * margin),
+            float(maximum[1] - minimum[1] + 2 * margin),
+        )
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(0)
+
+    def boundingRect(self) -> QRectF:
+        return self.rect
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        del option, widget
+        color = QApplication.palette().color(QPalette.ColorRole.Highlight)
+        segment_count = self.positions.shape[0] - 1
+        for segment in range(segment_count):
+            color.setAlpha(int(35 + 145 * (segment + 1) / segment_count))
+            painter.setPen(QPen(color, self.width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            starts, ends = self.positions[segment], self.positions[segment + 1]
+            for start, end in zip(starts, ends, strict=True):
+                painter.drawLine(
+                    QPointF(float(start[0]), float(start[1])),
+                    QPointF(float(end[0]), float(end[1])),
+                )
+
+
 class IceView(QGraphicsView):
     def __init__(self, scene: QGraphicsScene) -> None:
         super().__init__(scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        # Foreground annotations live in viewport coordinates.  Scroll-bar and
+        # hand panning normally use pixel blits, which drag stale copies of
+        # those annotations across the canvas.  This view must repaint as a
+        # whole whenever its contents move.
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self._apply_palette()
         self.field_colatitude_deg = 90.0
         self.field_azimuth_deg = 0.0
+        self.show_scale_bar = True
+        self.show_charge_legend = True
+        self.scale_units = "um"
         self._middle_panning = False
         self._pan_position = None
         self.setToolTip("Mouse wheel: zoom · Middle-drag: pan · Drag: select traps")
@@ -281,6 +434,33 @@ class IceView(QGraphicsView):
         painter.drawEllipse(endpoint, 2.8, 2.8)
         painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
         painter.drawText(QPointF(12, 72), f"B, z={np.cos(theta):+.2f}")
+        if self.show_scale_bar:
+            pixels_per_unit = max(abs(self.transform().m11()), 1e-12)
+            raw = 100 / pixels_per_unit
+            exponent = 10 ** math.floor(math.log10(max(raw, 1e-12)))
+            scaled = raw / exponent
+            nice = (1 if scaled < 2 else 2 if scaled < 5 else 5) * exponent
+            width = nice * pixels_per_unit
+            y = self.viewport().height() - 24
+            color = self.palette().color(QPalette.ColorRole.Text)
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(QPointF(22, y), QPointF(22 + width, y))
+            painter.drawLine(QPointF(22, y - 4), QPointF(22, y + 4))
+            painter.drawLine(QPointF(22 + width, y - 4), QPointF(22 + width, y + 4))
+            painter.drawText(QPointF(22, y - 7), f"{nice:g} {self.scale_units}")
+        if self.show_charge_legend:
+            x = self.viewport().width() - 152
+            y = 24
+            painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
+            painter.drawText(QPointF(x, y), "vertex charge")
+            for index, charge in enumerate((-4, -2, 0, 2, 4)):
+                cx = x + index * 30
+                color = (self.palette().color(QPalette.ColorRole.Mid) if charge == 0
+                         else ChargeItem.COLORS[charge])
+                painter.setBrush(QBrush(color)); painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(cx + 5, y + 13), 4, 4)
+                painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
+                painter.drawText(QPointF(cx, y + 30), f"{charge:+d}")
         painter.restore()
 
 
@@ -439,6 +619,9 @@ class PlaybackBar(QWidget):
             layout.addWidget(button)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         layout.addWidget(self.slider, 1)
+        layout.addWidget(QLabel("Go to"))
+        self.frame_input = QSpinBox(); self.frame_input.setMinimum(1); self.frame_input.setFixedWidth(78)
+        layout.addWidget(self.frame_input)
         self.position = QLabel("Frame – / –")
         self.position.setMinimumWidth(150)
         layout.addWidget(self.position)
@@ -453,15 +636,21 @@ class PlaybackBar(QWidget):
         self.next.clicked.connect(lambda: self.seek_callback(self.slider.value() + 1))
         self.last.clicked.connect(lambda: self.seek_callback(self.slider.maximum()))
         self.slider.valueChanged.connect(self.seek_callback)
+        self.frame_input.editingFinished.connect(
+            lambda: self.seek_callback(self.frame_input.value() - 1)
+        )
 
     def configure(self, frame_count: int) -> None:
         self.slider.setRange(0, max(frame_count - 1, 0))
+        self.frame_input.setRange(1, max(frame_count, 1))
         self.setVisible(True)
 
     def show_position(self, position: int, frame_value: str, time_value: str | None) -> None:
         self.slider.blockSignals(True)
         self.slider.setValue(position)
         self.slider.blockSignals(False)
+        self.frame_input.blockSignals(True); self.frame_input.setValue(position + 1)
+        self.frame_input.blockSignals(False)
         self.position.setText(f"Frame {frame_value}  ({position + 1}/{self.slider.maximum() + 1})")
         self.time.setText("" if time_value is None else f"t = {time_value}")
 
@@ -554,11 +743,72 @@ class TrajectoryPane(FoldablePane):
         self.memory.setText(f"≈ {mib:.1f} MiB maximum" if mib < 10 else f"≈ {mib:.0f} MiB maximum")
 
 
+class ComparisonPane(FoldablePane):
+    def __init__(self, callback, parent=None) -> None:
+        super().__init__("Frame comparison", expanded=False, parent=parent)
+        form = QFormLayout(self.body)
+        self.a = QLabel("not marked")
+        self.b = QLabel("not marked")
+        mark_row = QWidget(); mark_layout = QHBoxLayout(mark_row); mark_layout.setContentsMargins(0, 0, 0, 0)
+        mark_a = QPushButton("Mark A"); jump_a = QPushButton("Go to A")
+        mark_layout.addWidget(mark_a); mark_layout.addWidget(jump_a)
+        mark_b_row = QWidget(); mark_b_layout = QHBoxLayout(mark_b_row); mark_b_layout.setContentsMargins(0, 0, 0, 0)
+        mark_b = QPushButton("Mark B"); jump_b = QPushButton("Go to B")
+        mark_b_layout.addWidget(mark_b); mark_b_layout.addWidget(jump_b)
+        self.show = QCheckBox("Show A → B displacement and flips")
+        clear = QPushButton("Clear comparison")
+        form.addRow("A", self.a); form.addRow(mark_row)
+        form.addRow("B", self.b); form.addRow(mark_b_row)
+        form.addRow(self.show); form.addRow(clear)
+        mark_a.clicked.connect(lambda: callback("mark_a"))
+        mark_b.clicked.connect(lambda: callback("mark_b"))
+        jump_a.clicked.connect(lambda: callback("jump_a"))
+        jump_b.clicked.connect(lambda: callback("jump_b"))
+        clear.clicked.connect(lambda: callback("clear"))
+        self.show.toggled.connect(lambda: callback("show"))
+        self.setVisible(False)
+
+    def set_marker(self, name: str, text: str) -> None:
+        getattr(self, name.lower()).setText(text)
+
+    def clear_markers(self) -> None:
+        self.a.setText("not marked"); self.b.setText("not marked")
+        self.show.blockSignals(True); self.show.setChecked(False); self.show.blockSignals(False)
+
+
+class OverlayPane(FoldablePane):
+    def __init__(self, callback, parent=None) -> None:
+        super().__init__("Visual overlays", expanded=False, parent=parent)
+        form = QFormLayout(self.body)
+        self.traps = QCheckBox("Trap bodies"); self.traps.setChecked(True)
+        self.particles = QCheckBox("Particles"); self.particles.setChecked(True)
+        self.ids = QCheckBox("Particle / trap IDs")
+        self.ids.setToolTip("IDs appear as fixed-size badges when the lattice is sufficiently zoomed in.")
+        self.boundary = QCheckBox("Periodic box"); self.boundary.setChecked(True)
+        self.scale_bar = QCheckBox("Scale bar"); self.scale_bar.setChecked(True)
+        self.charge_legend = QCheckBox("Charge legend"); self.charge_legend.setChecked(True)
+        self.trails = QCheckBox("Particle trails (trajectory)")
+        self.trail_length = QSpinBox(); self.trail_length.setRange(2, 100); self.trail_length.setValue(8)
+        self.trail_length.setToolTip("Uses preceding frames that are already in the trajectory cache.")
+        self.charges = QComboBox(); self.charges.addItems(["Off", "Nonzero", "All"])
+        self.charges.setCurrentText("Nonzero")
+        for widget in (self.traps, self.particles, self.ids, self.boundary,
+                       self.scale_bar, self.charge_legend):
+            form.addRow(widget)
+            widget.toggled.connect(callback)
+        form.addRow("Vertex charges", self.charges)
+        form.addRow(self.trails)
+        form.addRow("Trail frames", self.trail_length)
+        self.charges.currentTextChanged.connect(callback)
+        self.trails.toggled.connect(callback)
+        self.trail_length.valueChanged.connect(callback)
+
+
 class ParameterPanel(QWidget):
     def __init__(
         self, document: IceDocument, change_callback, lattice_callback,
         configuration_callback, trajectory_settings_callback,
-        extract_frame_callback, parent=None,
+        extract_frame_callback, overlay_callback, comparison_callback, parent=None,
     ) -> None:
         super().__init__(parent)
         self.change_callback = change_callback
@@ -583,6 +833,8 @@ class ParameterPanel(QWidget):
             trajectory_settings_callback, extract_frame_callback, self,
         )
         layout.addWidget(self.trajectory_pane)
+        self.comparison_pane = ComparisonPane(comparison_callback, self)
+        layout.addWidget(self.comparison_pane)
 
         self.lattice_pane = FoldablePane("Lattice")
         lattice_form = QFormLayout(self.lattice_pane.body)
@@ -652,6 +904,8 @@ class ParameterPanel(QWidget):
         calculation_form.addRow("Cutoff (um; 0 = all)", self.cutoff)
         calculation_form.addRow(self.energy_result)
         layout.addWidget(self.energy_pane)
+        self.overlay_pane = OverlayPane(overlay_callback, self)
+        layout.addWidget(self.overlay_pane)
         layout.addStretch(1)
 
         for box in (self.radius, self.susceptibility, self.field,
@@ -725,6 +979,7 @@ class ParameterPanel(QWidget):
         self.apply_lattice.setEnabled(not enabled and self._generated_square)
         self.apply_configuration.setEnabled(not enabled)
         self.configuration.setEnabled(not enabled)
+        self.comparison_pane.setVisible(enabled)
 
     def _update_box_size(self) -> None:
         self.box_size.setText(
@@ -779,6 +1034,11 @@ class MainWindow(QMainWindow):
         self.charge_mode = "Nonzero"
         self.charge_items: list[ChargeItem] = []
         self.trap_items: list[TrapItem] = []
+        self.boundary_item: BoundaryItem | None = None
+        self.comparison_item: ComparisonItem | None = None
+        self.trail_item: TrailItem | None = None
+        self.comparison_a: VisualSnapshot | None = None
+        self.comparison_b: VisualSnapshot | None = None
         self.undo_stack = QUndoStack(self)
         self.scene = QGraphicsScene(self); self.scene.selectionChanged.connect(self.update_status)
         self.view = IceView(self.scene); self.status = QLabel()
@@ -854,6 +1114,19 @@ class MainWindow(QMainWindow):
             QToolButton { padding: 4px 6px; border-radius: 4px; }
             QToolButton:hover { background: palette(alternate-base); }
         """)
+        self.mode_badge = QLabel(" STATE ")
+        self.mode_badge.setStyleSheet("""
+            QLabel {
+                background: palette(alternate-base);
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                color: palette(text);
+                font-weight: 700;
+                padding: 3px 6px;
+            }
+        """)
+        toolbar.addWidget(self.mode_badge)
+        toolbar.addSeparator()
         for action in (self.new_action, self.open_action, self.save_action):
             toolbar.addAction(action)
         toolbar.addSeparator()
@@ -879,7 +1152,8 @@ class MainWindow(QMainWindow):
         self.parameter_panel = ParameterPanel(
             self.document, self.set_energy_parameters, self.apply_lattice_parameters,
             self.apply_configuration, self.trajectory_settings_changed,
-            self.extract_trajectory_frame, self,
+            self.extract_trajectory_frame, self.apply_overlays,
+            self.comparison_action, self,
         )
         dock = QDockWidget("Physical parameters", self)
         dock.setWindowTitle("Inspector")
@@ -908,16 +1182,21 @@ class MainWindow(QMainWindow):
     def rebuild_scene(self, *, fit: bool = True) -> None:
         self.charge_items.clear()
         self.trap_items.clear()
+        self.boundary_item = None
+        self.comparison_item = None
+        self.trail_item = None
         self.scene.clear()
         for index, trap in enumerate(self.document.traps):
-            item = TrapItem(index, self.document, self.flip_indices)
+            item = TrapItem(index, self.document, self.flip_indices, self.show_trap_context)
             item.setPos(float(trap.center[0]), float(-trap.center[1]))
             item.setToolTip(f"id {trap.id} | center ({trap.center[0]:g}, {trap.center[1]:g})")
             if self.trajectory_session is not None:
-                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                item.setAcceptedMouseButtons(Qt.MouseButton.RightButton)
             self.scene.addItem(item)
             self.trap_items.append(item)
-        self.rebuild_charge_overlay()
+        self.rebuild_boundary_overlay()
+        self.apply_overlays()
+        self.rebuild_comparison_overlay()
         margin = max(self.document.trap_separation, 1.0)
         self.content_rect = self.scene.itemsBoundingRect().adjusted(-margin, -margin, margin, margin)
         # QGraphicsView otherwise locks a fitted scene to the viewport center
@@ -954,8 +1233,50 @@ class MainWindow(QMainWindow):
             self.scene.addItem(item)
             self.charge_items.append(item)
 
+    def rebuild_boundary_overlay(self) -> None:
+        if self.boundary_item is not None and self.boundary_item.scene() is self.scene:
+            self.scene.removeItem(self.boundary_item)
+        self.boundary_item = None
+        if (self.document.geometry != "square" or self.document.nx is None
+                or self.document.ny is None or self.document.lattice_constant is None):
+            return
+        lx = self.document.nx * self.document.lattice_constant
+        ly = self.document.ny * self.document.lattice_constant
+        width = max(self.document.trap_separation * 0.055, 0.035)
+        self.boundary_item = BoundaryItem(QRectF(0, -ly, lx, ly), width)
+        self.scene.addItem(self.boundary_item)
+
+    def apply_overlays(self, *unused) -> None:
+        del unused
+        if not hasattr(self, "parameter_panel"):
+            return
+        pane = self.parameter_panel.overlay_pane
+        for item in self.trap_items:
+            item.show_body = pane.traps.isChecked()
+            item.show_particle = pane.particles.isChecked()
+            item.show_id = pane.ids.isChecked()
+            item.update()
+        if self.boundary_item is not None:
+            self.boundary_item.setVisible(pane.boundary.isChecked())
+        self.view.show_scale_bar = pane.scale_bar.isChecked()
+        self.view.show_charge_legend = pane.charge_legend.isChecked()
+        self.view.scale_units = self.document.units
+        mode = pane.charges.currentText()
+        if mode != self.charge_mode:
+            self.charge_mode = mode
+            self.charge_selector.blockSignals(True)
+            self.charge_selector.setCurrentText(mode)
+            self.charge_selector.blockSignals(False)
+        self.rebuild_charge_overlay()
+        self.rebuild_trail_overlay()
+        self.view.viewport().update()
+        self.update_status()
+
     def set_charge_mode(self, mode: str) -> None:
         self.charge_mode = mode
+        if hasattr(self, "parameter_panel"):
+            selector = self.parameter_panel.overlay_pane.charges
+            selector.blockSignals(True); selector.setCurrentText(mode); selector.blockSignals(False)
         self.rebuild_charge_overlay()
         self.update_status()
 
@@ -1052,6 +1373,36 @@ class MainWindow(QMainWindow):
         indices = [item.index for item in self.scene.selectedItems() if isinstance(item, TrapItem)]
         if indices: self.flip_indices(indices)
 
+    def show_trap_context(self, index: int, screen_position) -> None:
+        trap = self.document.traps[index]
+        displacement = trap.displayed_displacement(self.document.trap_separation)
+        lines = [
+            f"id: {trap.id}",
+            "center: " + ", ".join(f"{value:.7g}" for value in trap.center),
+            "axis: " + ", ".join(f"{value:.7g}" for value in trap.axis),
+            f"occupancy: {trap.occupancy:+d}",
+            "displacement: " + ", ".join(f"{value:.7g}" for value in displacement),
+        ]
+        if trap.extras:
+            lines.append("metadata: " + ", ".join(
+                f"{key}={value}" for key, value in trap.extras.items()
+            ))
+        menu = QMenu(self)
+        menu.addSection(f"Trap {trap.id}")
+        for line in lines[1:]:
+            detail = menu.addAction(line)
+            detail.setEnabled(False)
+        menu.addSeparator()
+        copy_action = menu.addAction("Copy details")
+        flip_action = None
+        if self.trajectory_session is None:
+            flip_action = menu.addAction("Flip trap")
+        selected = menu.exec(screen_position)
+        if selected is copy_action:
+            QApplication.clipboard().setText("\n".join(lines))
+        elif flip_action is not None and selected is flip_action:
+            self.flip_indices([index])
+
     def apply_configuration(self, name: str) -> None:
         if self.trajectory_session is not None:
             return
@@ -1125,6 +1476,7 @@ class MainWindow(QMainWindow):
             self.current_trajectory_position = None
             pane.hide_progress(); pane.set_metadata(source.metadata)
             self.playback.configure(source.metadata.frame_count)
+            self.mode_badge.setText(" TRAJECTORY ")
             self.flip_action.setEnabled(False)
             self.undo_action.setEnabled(False); self.redo_action.setEnabled(False)
             self.parameter_panel.set_trajectory_mode(True)
@@ -1226,6 +1578,7 @@ class MainWindow(QMainWindow):
         if entry.time is not None:
             current_text += f" · t={entry.time}"
         self.parameter_panel.trajectory_pane.set_current(current_text)
+        self.rebuild_trail_overlay()
         diagnostics = self.parameter_panel.trajectory_pane.diagnostics.currentText()
         if diagnostics == "Every frame" or (diagnostics == "When paused" and not self.play_timer.isActive()):
             self.update_energy()
@@ -1309,18 +1662,120 @@ class MainWindow(QMainWindow):
         document.name = f"{document.name}-frame-{frame_value}"
         self.set_document(document)
 
+    def _visual_snapshot(self) -> VisualSnapshot | None:
+        session = self.trajectory_session
+        if session is None or self.current_trajectory_position is None:
+            return None
+        positions = []
+        for trap in self.document.traps:
+            displacement = trap.displayed_displacement(self.document.trap_separation)
+            positions.append((
+                float(trap.center[0] + displacement[0]),
+                float(-(trap.center[1] + displacement[1])),
+            ))
+        entry = session.source.metadata.frames[self.current_trajectory_position]
+        return VisualSnapshot(
+            self.current_trajectory_position, entry.value,
+            tuple(trap.id for trap in self.document.traps),
+            np.asarray(positions, dtype=float), self.document.occupancies().copy(),
+        )
+
+    def comparison_action(self, action: str) -> None:
+        pane = self.parameter_panel.comparison_pane
+        if action in ("mark_a", "mark_b"):
+            snapshot = self._visual_snapshot()
+            if snapshot is None:
+                return
+            if action == "mark_a":
+                self.comparison_a = snapshot
+                pane.set_marker("a", f"frame {snapshot.frame_value}")
+            else:
+                self.comparison_b = snapshot
+                pane.set_marker("b", f"frame {snapshot.frame_value}")
+            if self.comparison_a is not None and self.comparison_b is not None:
+                pane.show.setChecked(True)
+        elif action == "jump_a" and self.comparison_a is not None:
+            self.seek_trajectory(self.comparison_a.position)
+        elif action == "jump_b" and self.comparison_b is not None:
+            self.seek_trajectory(self.comparison_b.position)
+        elif action == "clear":
+            self.comparison_a = None; self.comparison_b = None
+            pane.clear_markers()
+        self.rebuild_comparison_overlay()
+
+    def rebuild_comparison_overlay(self) -> None:
+        if self.comparison_item is not None and self.comparison_item.scene() is self.scene:
+            self.scene.removeItem(self.comparison_item)
+        self.comparison_item = None
+        if not hasattr(self, "parameter_panel"):
+            return
+        pane = self.parameter_panel.comparison_pane
+        first, second = self.comparison_a, self.comparison_b
+        if not pane.show.isChecked() or first is None or second is None:
+            return
+        if first.ids != second.ids:
+            pane.show.blockSignals(True); pane.show.setChecked(False); pane.show.blockSignals(False)
+            QMessageBox.warning(
+                self, "Frames cannot be compared",
+                "Frames A and B do not contain the same ordered trap IDs.",
+            )
+            return
+        width = max(self.document.trap_separation * 0.065, 0.04)
+        self.comparison_item = ComparisonItem(first, second, width)
+        self.scene.addItem(self.comparison_item)
+
+    def rebuild_trail_overlay(self) -> None:
+        if self.trail_item is not None and self.trail_item.scene() is self.scene:
+            self.scene.removeItem(self.trail_item)
+        self.trail_item = None
+        if not hasattr(self, "parameter_panel"):
+            return
+        pane = self.parameter_panel.overlay_pane
+        session = self.trajectory_session
+        current = self.current_trajectory_position
+        if not pane.trails.isChecked() or session is None or current is None:
+            return
+        tables = []
+        for position in range(current, max(-1, current - pane.trail_length.value()), -1):
+            table = session.cached_frame(position)
+            if table is None:
+                break
+            tables.append(table)
+        tables.reverse()
+        if len(tables) < 2:
+            return
+        expected_ids = tuple(int(value) for value in tables[-1].get_column("id").to_list())
+        positions = []
+        for table in tables:
+            ids = tuple(int(value) for value in table.get_column("id").to_list())
+            if ids != expected_ids:
+                return
+            x = table.get_column("x").to_numpy() + table.get_column("cx").to_numpy()
+            y = -(table.get_column("y").to_numpy() + table.get_column("cy").to_numpy())
+            positions.append(np.column_stack((x, y)))
+        width = max(self.document.trap_separation * 0.045, 0.025)
+        self.trail_item = TrailItem(np.stack(positions), width)
+        self.scene.addItem(self.trail_item)
+
     def _leave_trajectory_mode(self) -> None:
         self.pause_playback()
         self.trajectory_token += 1
         self.trajectory_session = None
         self.current_trajectory_position = None
+        self.comparison_a = None; self.comparison_b = None
+        if self.trail_item is not None and self.trail_item.scene() is self.scene:
+            self.scene.removeItem(self.trail_item)
+        self.trail_item = None
         self.loading_chunks.clear()
         self.playback.setVisible(False)
         if hasattr(self, "parameter_panel"):
             self.parameter_panel.trajectory_pane.setVisible(False)
+            self.parameter_panel.comparison_pane.clear_markers()
             self.parameter_panel.set_trajectory_mode(False)
         if hasattr(self, "flip_action"):
             self.flip_action.setEnabled(True)
+        if hasattr(self, "mode_badge"):
+            self.mode_badge.setText(" STATE ")
 
     def set_document(self, document: IceDocument, path: Path | None = None) -> None:
         self._leave_trajectory_mode()

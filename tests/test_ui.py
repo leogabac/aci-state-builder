@@ -55,11 +55,23 @@ class TrajectoryUiTests(unittest.TestCase):
                 window._open_trajectory_path(str(path))
                 self.assertTrue(self._wait_until(lambda: window.current_trajectory_position == 0))
                 items = [id(item) for item in window.trap_items]
+                window.comparison_action("mark_a")
                 window.request_trajectory_frame(3)
                 self.assertTrue(self._wait_until(lambda: window.current_trajectory_position == 3))
+                window.comparison_action("mark_b")
                 self.assertEqual(items, [id(item) for item in window.trap_items])
                 self.assertEqual(window.playback.slider.value(), 3)
                 self.assertFalse(window.parameter_panel.trajectory_pane.isHidden())
+                self.assertEqual(window.mode_badge.text().strip(), "TRAJECTORY")
+                self.assertIsNotNone(window.comparison_item)
+                self.assertEqual(window.comparison_a.position, 0)
+                self.assertEqual(window.comparison_b.position, 3)
+                window.parameter_panel.overlay_pane.traps.setChecked(False)
+                self.assertTrue(all(not item.show_body for item in window.trap_items))
+                self.assertIsNotNone(window.boundary_item)
+                window.parameter_panel.overlay_pane.trails.setChecked(True)
+                self.assertIsNotNone(window.trail_item)
+                self.assertEqual(window.trail_item.positions.shape, (4, 8, 2))
                 horizontal = window.view.horizontalScrollBar()
                 vertical = window.view.verticalScrollBar()
                 before = horizontal.value(), vertical.value()
@@ -103,12 +115,20 @@ class TrajectoryUiTests(unittest.TestCase):
                 pos=QPoint(160, 140),
             )
             self.assertTrue(window.view._middle_panning)
+            self.assertEqual(
+                window.view.viewportUpdateMode(),
+                window.view.ViewportUpdateMode.FullViewportUpdate,
+            )
             QTest.mouseMove(window.view.viewport(), QPoint(185, 155))
             QTest.mouseRelease(
                 window.view.viewport(), Qt.MouseButton.MiddleButton,
                 pos=QPoint(185, 155),
             )
             self.assertFalse(window.view._middle_panning)
+            self.assertEqual(
+                window.view.viewportUpdateMode(),
+                window.view.ViewportUpdateMode.FullViewportUpdate,
+            )
             self.assertNotEqual((horizontal.value(), vertical.value()), before)
         finally:
             window.close()

@@ -30,11 +30,19 @@ rpy run aci-state-builder
   reusable external frame index and a user-controlled bounded chunk cache.
 - Scrub or play trajectories, choose frame stride and playback speed, prefetch
   upcoming frames, and extract the current frame into an editable state.
+- Mark trajectory frames A and B for a lightweight visual comparison of
+  particle displacements and flipped traps, with direct jumps back to either
+  reference frame.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
 - Save richer, versioned `.aci.json` project files.
 - Display periodic topological charges `q = N_in - N_out` as either nonzero-only
   or all-vertex overlays, with modulo wrapping across both PBC seams.
 - Display live charge counts and validate states.
+- Independently toggle trap bodies, particles, IDs, periodic boundaries,
+  charges, charge legend, and a zoom-aware physical scale bar.
+- Show short particle trails from frames already held in the bounded cache;
+  right-click a trap or particle to inspect and copy its coordinates, state,
+  displacement, and imported metadata.
 - Use a persistent right-hand parameter pane for lattice dimensions and spacing,
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.
