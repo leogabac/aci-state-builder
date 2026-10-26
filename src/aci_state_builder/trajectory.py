@@ -226,6 +226,23 @@ class IndexedCsvTrajectory:
             raise TrajectoryFormatError("trajectory index no longer matches the CSV")
         return FrameChunk(start, table, tuple(offsets))
 
+    def load_frame(self, position: int) -> pl.DataFrame:
+        """Read one indexed frame without decoding neighboring CSV frames."""
+        if not 0 <= position < self.metadata.frame_count:
+            raise IndexError("frame is outside the trajectory")
+        entry = self.metadata.frames[position]
+        with self.path.open("rb") as stream:
+            stream.seek(entry.start)
+            data = stream.read(entry.end - entry.start)
+        header = ",".join(self.metadata.columns).encode("utf-8") + b"\n"
+        try:
+            table = pl.read_csv(BytesIO(header + data), infer_schema_length=entry.rows)
+        except Exception as error:
+            raise TrajectoryFormatError(f"could not load trajectory frame: {error}") from error
+        if table.height != entry.rows:
+            raise TrajectoryFormatError("trajectory index no longer matches the CSV")
+        return table
+
 
 class TrajectorySession:
     def __init__(self, source: IndexedCsvTrajectory, chunk_size: int = 256, max_chunks: int = 3) -> None:

@@ -5,26 +5,73 @@ from pathlib import Path
 import sys
 import math
 import csv
+import os
+from threading import Event
+from time import perf_counter
 
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPolygonF, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
     QFrame, QHBoxLayout, QInputDialog, QMainWindow, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QStyle,
+    QPushButton, QProgressDialog, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QStyle,
     QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .formats import StateFormatError, document_from_frame, read_csv, write_csv
 from .energy import EnergyParameters, calculate_energy
-from .geometry import periodic_square, periodic_vertex_charges, periodic_vertex_data
+from .geometry import (
+    BOUNDARY_LABELS, GEOMETRY_LABELS, create_lattice, periodic_square,
+    vertex_charges, vertex_data,
+)
 from .model import IceDocument
-from .presets import SQUARE_CONFIGURATIONS, randomized
+from .presets import SQUARE_CONFIGURATIONS, polarized, randomized
 from .validation import validate
 from .trajectory import IndexedCsvTrajectory, TrajectoryFormatError, TrajectorySession
+from .video import VideoExportOptions, export_trajectory_video
+
+
+def compact_trajectory_value(value: str) -> str:
+    """Shorten numeric CSV labels for display without changing their raw value."""
+    text = value.strip()
+    if not text:
+        return text
+    # Plain integer frame IDs are identifiers as much as numbers; preserve
+    # their spelling (including deliberate leading zeroes).
+    if text.lstrip("+-").isdigit():
+        return text
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if not math.isfinite(number):
+        return text
+    if number == 0:
+        return "0"
+    compact = f"{number:.7g}"
+    if "e" in compact:
+        mantissa, exponent = compact.split("e", 1)
+        return f"{mantissa}e{int(exponent)}"
+    return compact
+
+
+def configure_desktop_integration() -> None:
+    """Prefer the desktop-native file chooser, including its Places sidebar."""
+    desktop = ":".join((
+        os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        os.environ.get("DESKTOP_SESSION", ""),
+    )).casefold()
+    # The PySide wheel used by the rpy environment does not bundle Plasma's
+    # platform-theme plugin. It does bundle Qt's portal theme, while Plasma's
+    # xdg-desktop-portal-kde backend supplies the actual KDE chooser and its
+    # Dolphin Places model: pinned folders, removable media, and mounts.
+    if "kde" in desktop or "plasma" in desktop:
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
+    # An unavailable native backend safely falls back to Qt's own dialog.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, False)
 
 
 class WorkerSignals(QObject):
@@ -113,7 +160,15 @@ class TrapItem(QGraphicsItem):
             painter.save()
             painter.rotate(angle)
             painter.setPen(QPen(outline, max(radius * 0.13, 0.035)))
-            painter.setBrush(QBrush(palette.color(QPalette.ColorRole.AlternateBase)))
+            body = palette.color(QPalette.ColorRole.AlternateBase)
+            if abs(float(self.trap.center[2])) > 1e-12:
+                # A restrained tint is the projected cue that this trap lies on
+                # the raised sublattice; its true z remains available in details.
+                accent = palette.color(QPalette.ColorRole.Highlight)
+                body.setRed((2 * body.red() + accent.red()) // 3)
+                body.setGreen((2 * body.green() + accent.green()) // 3)
+                body.setBlue((2 * body.blue() + accent.blue()) // 3)
+            painter.setBrush(QBrush(body))
             painter.drawPath(peanut)
             barrier = palette.color(QPalette.ColorRole.Mid)
             barrier.setAlpha(135)
@@ -240,10 +295,27 @@ class VisualSnapshot:
     document: IceDocument
 
 
+def _boundary_points(document: IceDocument) -> list[QPointF]:
+    if document.boundary != "periodic" or len(document.cell_vectors) != 2:
+        return []
+    first, second = np.asarray(document.cell_vectors, dtype=float)
+    return [
+        QPointF(0, 0), QPointF(float(first[0]), float(-first[1])),
+        QPointF(float(first[0] + second[0]), float(-first[1] - second[1])),
+        QPointF(float(second[0]), float(-second[1])),
+    ]
+
+
+def _charge_values(document: IceDocument) -> tuple[int, ...]:
+    coordination = max(document.vertex_coordination, default=4)
+    return tuple(range(-coordination, coordination + 1, 2))
+
+
 class BoundaryItem(QGraphicsItem):
-    def __init__(self, rect: QRectF, width: float) -> None:
+    def __init__(self, points: list[QPointF], width: float) -> None:
         super().__init__()
-        self.rect = rect
+        self.polygon = QPolygonF(points)
+        self.rect = self.polygon.boundingRect()
         self.width = width
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setZValue(-2)
@@ -257,7 +329,7 @@ class BoundaryItem(QGraphicsItem):
         color.setAlpha(150)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(color, self.width, Qt.PenStyle.DashLine))
-        painter.drawRect(self.rect)
+        painter.drawPolygon(self.polygon)
 
 
 class ComparisonItem(QGraphicsItem):
@@ -366,6 +438,7 @@ class IceView(QGraphicsView):
         self.field_azimuth_deg = 0.0
         self.show_scale_bar = True
         self.show_charge_legend = True
+        self.charge_values = (-4, -2, 0, 2, 4)
         self.scale_units = "um"
         self._middle_panning = False
         self._pan_position = None
@@ -472,10 +545,11 @@ class IceView(QGraphicsView):
             y = 24
             painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
             painter.drawText(QPointF(x, y), "vertex charge")
-            for index, charge in enumerate((-4, -2, 0, 2, 4)):
+            values = self.charge_values
+            for index, charge in enumerate(values):
                 cx = x + index * 30
                 color = (self.palette().color(QPalette.ColorRole.Mid) if charge == 0
-                         else ChargeItem.COLORS[charge])
+                         else ChargeItem.COLORS.get(charge, QColor("#6b2737") if charge > 0 else QColor("#243b6b")))
                 painter.setBrush(QBrush(color)); painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawEllipse(QPointF(cx + 5, y + 13), 4, 4)
                 painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Text)))
@@ -524,8 +598,10 @@ class FieldDirectionPreview(QWidget):
 class NewDocumentDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("New periodic square ice")
+        self.setWindowTitle("New artificial ice lattice")
         form = QFormLayout(self)
+        self.geometry = QComboBox()
+        for key, label in GEOMETRY_LABELS.items(): self.geometry.addItem(label, key)
         self.nx = QSpinBox(); self.nx.setRange(1, 200); self.nx.setValue(10)
         self.ny = QSpinBox(); self.ny.setRange(1, 200); self.ny.setValue(10)
         self.lattice = QDoubleSpinBox(); self.lattice.setRange(0.001, 1_000_000)
@@ -537,21 +613,88 @@ class NewDocumentDialog(QDialog):
         self.trap_height.setDecimals(6); self.trap_height.setValue(8.0)
         self.trap_stiffness = QDoubleSpinBox(); self.trap_stiffness.setRange(0, 1_000_000)
         self.trap_stiffness.setDecimals(6); self.trap_stiffness.setValue(0.1)
-        self.boundary = QComboBox(); self.boundary.addItem("Periodic")
+        self.height_offset = QDoubleSpinBox(); self.height_offset.setRange(0, 1_000_000)
+        self.height_offset.setDecimals(6); self.height_offset.setValue(0.8)
+        self.boundary = QComboBox()
+        for key, label in BOUNDARY_LABELS.items(): self.boundary.addItem(label, key)
+        form.addRow("Geometry", self.geometry)
         form.addRow("Horizontal cells", self.nx); form.addRow("Vertical cells", self.ny)
         form.addRow("Lattice constant (um)", self.lattice)
         form.addRow("Trap separation (um)", self.separation)
         form.addRow("Trap height (pN nm)", self.trap_height)
         form.addRow("Trap stiffness (pN/nm)", self.trap_stiffness)
         form.addRow("Boundary", self.boundary)
+        form.addRow("Height offset (um)", self.height_offset)
+        self.geometry.currentIndexChanged.connect(self._geometry_changed)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); form.addRow(buttons)
+        self._geometry_changed()
+
+    def _geometry_changed(self) -> None:
+        height_mode = self.geometry.currentData() == "square3d"
+        self.height_offset.setEnabled(height_mode)
+        if height_mode:
+            self.boundary.setCurrentIndex(self.boundary.findData("periodic"))
+        self.boundary.setEnabled(not height_mode)
 
     def create_document(self) -> IceDocument:
-        document = periodic_square(self.nx.value(), self.ny.value(), self.lattice.value(), self.separation.value())
+        document = create_lattice(
+            self.geometry.currentData(), self.nx.value(), self.ny.value(),
+            self.lattice.value(), self.separation.value(), self.boundary.currentData(),
+            self.height_offset.value(),
+        )
         document.trap_height_pn_nm = self.trap_height.value()
         document.trap_stiffness_pn_per_nm = self.trap_stiffness.value()
         return document
+
+
+class VideoExportDialog(QDialog):
+    def __init__(self, frame_count: int, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export trajectory video")
+        form = QFormLayout(self)
+        self.start = QSpinBox(); self.start.setRange(1, frame_count); self.start.setValue(1)
+        self.stop = QSpinBox(); self.stop.setRange(1, frame_count); self.stop.setValue(frame_count)
+        self.stride = QSpinBox(); self.stride.setRange(1, frame_count); self.stride.setValue(1)
+        self.fps = QSpinBox(); self.fps.setRange(1, 120); self.fps.setValue(30)
+        self.resolution = QComboBox()
+        self.resolution.addItem("1920 × 1080 (Full HD)", (1920, 1080))
+        self.resolution.addItem("1280 × 720 (HD)", (1280, 720))
+        self.resolution.addItem("2560 × 1440 (QHD)", (2560, 1440))
+        self.theme = QComboBox(); self.theme.addItem("Presentation dark", "dark"); self.theme.addItem("Publication light", "light")
+        self.quality = QComboBox(); self.quality.addItem("Balanced", "balanced"); self.quality.addItem("Draft", "draft"); self.quality.addItem("High", "high")
+        self.traps = QCheckBox("Trap bodies"); self.traps.setChecked(True)
+        self.boundary = QCheckBox("Lattice boundary"); self.boundary.setChecked(True)
+        self.charges = QCheckBox("Nonzero vertex charges")
+        self.trails = QSpinBox(); self.trails.setRange(0, 100); self.trails.setValue(0)
+        self.summary = QLabel(); self.summary.setWordWrap(True)
+        form.addRow("First frame", self.start); form.addRow("Last frame", self.stop)
+        form.addRow("Take every Nth frame", self.stride); form.addRow("Playback FPS", self.fps)
+        form.addRow("Resolution", self.resolution); form.addRow("Visual style", self.theme)
+        form.addRow("Encoding quality", self.quality)
+        form.addRow(self.traps); form.addRow(self.boundary); form.addRow(self.charges)
+        form.addRow("Trail length (video frames)", self.trails); form.addRow(self.summary)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Choose output…")
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); form.addRow(buttons)
+        for widget in (self.start, self.stop, self.stride, self.fps): widget.valueChanged.connect(self._update_summary)
+        self.start.valueChanged.connect(self.stop.setMinimum)
+        self.stop.valueChanged.connect(self.start.setMaximum)
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        count = max(0, (self.stop.value() - self.start.value()) // self.stride.value() + 1)
+        self.summary.setText(f"{count:,} rendered frames · {count / self.fps.value():.1f} seconds of video")
+
+    def options(self) -> VideoExportOptions:
+        width, height = self.resolution.currentData()
+        return VideoExportOptions(
+            start=self.start.value() - 1, stop=self.stop.value() - 1,
+            stride=self.stride.value(), fps=self.fps.value(), width=width, height=height,
+            theme=self.theme.currentData(), quality=self.quality.currentData(),
+            show_traps=self.traps.isChecked(), show_boundary=self.boundary.isChecked(),
+            show_charges=self.charges.isChecked(), trail_length=self.trails.value(),
+        )
 
 
 class FoldablePane(QWidget):
@@ -670,8 +813,16 @@ class PlaybackBar(QWidget):
         self.slider.blockSignals(False)
         self.frame_input.blockSignals(True); self.frame_input.setValue(position + 1)
         self.frame_input.blockSignals(False)
-        self.position.setText(f"Frame {frame_value}  ({position + 1}/{self.slider.maximum() + 1})")
-        self.time.setText("" if time_value is None else f"t = {time_value}")
+        frame_display = compact_trajectory_value(frame_value)
+        self.position.setText(f"Frame {frame_display}  ({position + 1}/{self.slider.maximum() + 1})")
+        self.position.setToolTip(
+            "" if frame_display == frame_value else f"Exact frame value: {frame_value}"
+        )
+        time_display = None if time_value is None else compact_trajectory_value(time_value)
+        self.time.setText("" if time_display is None else f"t = {time_display}")
+        self.time.setToolTip(
+            "" if time_value is None or time_display == time_value else f"Exact time value: {time_value}"
+        )
 
     def set_playing(self, playing: bool) -> None:
         self.play.setText("❚❚" if playing else "▶")
@@ -837,7 +988,10 @@ class SnapshotPanel(QWidget):
         self.document = snapshot.document
         layout = QVBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(4)
         controls = QHBoxLayout()
-        title = QLabel(f"Frame {snapshot.frame_value}"); title.setStyleSheet("font-weight: 700;")
+        frame_display = compact_trajectory_value(snapshot.frame_value)
+        title = QLabel(f"Frame {frame_display}"); title.setStyleSheet("font-weight: 700;")
+        if frame_display != snapshot.frame_value:
+            title.setToolTip(f"Exact frame value: {snapshot.frame_value}")
         self.traps = QCheckBox("Traps"); self.traps.setChecked(True)
         self.particles = QCheckBox("Particles"); self.particles.setChecked(True)
         self.ids = QCheckBox("IDs")
@@ -861,12 +1015,10 @@ class SnapshotPanel(QWidget):
             item.setToolTip(f"id {trap.id}")
             self.scene.addItem(item); self.items_by_id[trap.id] = item
         self.boundary_item = None
-        if (self.document.geometry == "square" and self.document.nx is not None
-                and self.document.ny is not None and self.document.lattice_constant is not None):
-            lx = self.document.nx * self.document.lattice_constant
-            ly = self.document.ny * self.document.lattice_constant
+        points = _boundary_points(self.document)
+        if points:
             width = max(self.document.trap_separation * 0.055, 0.035)
-            self.boundary_item = BoundaryItem(QRectF(0, -ly, lx, ly), width)
+            self.boundary_item = BoundaryItem(points, width)
             self.scene.addItem(self.boundary_item)
         self.charge_items: list[ChargeItem] = []
         self._apply_overlays()
@@ -895,11 +1047,11 @@ class SnapshotPanel(QWidget):
         mode = self.charges.currentText()
         if mode != "Off":
             radius = max(self.document.trap_separation * 0.40, 0.5)
-            for ix, iy, x, y, charge in periodic_vertex_data(self.document):
+            for vertex, x, y, charge, coordination in vertex_data(self.document):
                 if mode == "Nonzero" and charge == 0:
                     continue
                 item = ChargeItem(charge, radius); item.setPos(x, -y)
-                item.setToolTip(f"periodic vertex ({ix}, {iy}) | q = {charge:+d}")
+                item.setToolTip(f"vertex {vertex} | coordination {coordination} | q = {charge:+d}")
                 self.scene.addItem(item); self.charge_items.append(item)
         self.view.viewport().update()
 
@@ -934,7 +1086,10 @@ class SnapshotPanel(QWidget):
 class ComparisonDialog(QDialog):
     def __init__(self, first: VisualSnapshot, second: VisualSnapshot, export_callback, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Compare frames {first.frame_value} and {second.frame_value}")
+        self.setWindowTitle(
+            f"Compare frames {compact_trajectory_value(first.frame_value)} "
+            f"and {compact_trajectory_value(second.frame_value)}"
+        )
         self.resize(1350, 760)
         self._syncing = False
         self._closing = False
@@ -1051,15 +1206,23 @@ class ParameterPanel(QWidget):
 
         self.lattice_pane = FoldablePane("Lattice")
         lattice_form = QFormLayout(self.lattice_pane.body)
+        self.geometry = QComboBox()
+        for key, label in GEOMETRY_LABELS.items(): self.geometry.addItem(label, key)
+        self.lattice_boundary = QComboBox()
+        for key, label in BOUNDARY_LABELS.items(): self.lattice_boundary.addItem(label, key)
         self.nx = QSpinBox(); self.nx.setRange(1, 200)
         self.ny = QSpinBox(); self.ny.setRange(1, 200)
         self.lattice_constant = self._number(8.374011537, 0.001, 1_000_000, 6)
         self.box_size = QLabel()
+        self.height_offset = self._number(0.8, 0, 1_000_000, 6)
         self.apply_lattice = QPushButton("Apply lattice")
+        lattice_form.addRow("Geometry", self.geometry)
+        lattice_form.addRow("Boundary", self.lattice_boundary)
         lattice_form.addRow("Cells Nx", self.nx)
         lattice_form.addRow("Cells Ny", self.ny)
         lattice_form.addRow("Constant a (um)", self.lattice_constant)
         lattice_form.addRow("Box Lx x Ly", self.box_size)
+        lattice_form.addRow("Height offset (um)", self.height_offset)
         lattice_form.addRow(self.apply_lattice)
         layout.addWidget(self.lattice_pane)
 
@@ -1126,6 +1289,7 @@ class ParameterPanel(QWidget):
             box.valueChanged.connect(self._parameters_changed)
         for box in (self.nx, self.ny, self.lattice_constant):
             box.valueChanged.connect(self._update_box_size)
+        self.geometry.currentIndexChanged.connect(self._geometry_changed)
         self.apply_lattice.clicked.connect(self._apply_lattice)
         self.apply_configuration.clicked.connect(self._apply_configuration)
         self.set_document(document)
@@ -1161,9 +1325,15 @@ class ParameterPanel(QWidget):
         )
         for box, value in values:
             box.setValue(value)
-        generated_square = document.geometry == "square" and document.nx is not None and document.ny is not None
-        self._generated_square = generated_square
-        self.apply_lattice.setEnabled(generated_square)
+        geometry_index = self.geometry.findData(document.geometry)
+        boundary_index = self.lattice_boundary.findData(document.boundary)
+        if geometry_index >= 0: self.geometry.setCurrentIndex(geometry_index)
+        if boundary_index >= 0: self.lattice_boundary.setCurrentIndex(boundary_index)
+        self.height_offset.setValue(document.height_offset)
+        generated = geometry_index >= 0 and document.nx is not None and document.ny is not None
+        generated_square = document.geometry == "square" and generated
+        self._generated_lattice = generated
+        self.apply_lattice.setEnabled(generated)
         selected = self.configuration.currentText()
         self.configuration.clear()
         if generated_square:
@@ -1178,32 +1348,47 @@ class ParameterPanel(QWidget):
                 "Square-lattice topology labels. Which pattern is energetically "
                 f"favored depends on the field and interaction parameters.{parity_note}"
             )
+        elif generated:
+            self.configuration.addItems(["Polarized", "Randomize"])
+            self.configuration_note.setText(
+                "Generic configurations for this topology. Topology-specific ordered states can be added without ambiguous GS labels."
+            )
         else:
             self.configuration.addItem("Randomize")
-            self.configuration_note.setText(
-                "Only randomization is available for this imported/custom lattice."
-            )
+            self.configuration_note.setText("Only randomization is available for this imported/custom lattice.")
         if selected and self.configuration.findText(selected) >= 0:
             self.configuration.setCurrentText(selected)
         self._loading = False
+        self._geometry_changed()
         self._update_box_size()
 
     def set_trajectory_mode(self, enabled: bool) -> None:
-        self.apply_lattice.setEnabled(not enabled and self._generated_square)
+        self.apply_lattice.setEnabled(not enabled and self._generated_lattice)
         self.apply_configuration.setEnabled(not enabled)
         self.configuration.setEnabled(not enabled)
         self.comparison_pane.setVisible(enabled)
 
     def _update_box_size(self) -> None:
-        self.box_size.setText(
-            f"{self.nx.value() * self.lattice_constant.value():g} x "
-            f"{self.ny.value() * self.lattice_constant.value():g} um"
-        )
+        a = self.lattice_constant.value()
+        if self.geometry.currentData() in ("honeycomb", "triangular"):
+            self.box_size.setText(f"a1={self.nx.value() * a:g}; a2=({self.ny.value() * a / 2:g}, {self.ny.value() * np.sqrt(3) * a / 2:g}) um")
+        else:
+            self.box_size.setText(f"{self.nx.value() * a:g} x {self.ny.value() * a:g} um")
+
+    def _geometry_changed(self) -> None:
+        height_mode = self.geometry.currentData() == "square3d"
+        self.height_offset.setEnabled(height_mode)
+        if height_mode:
+            self.lattice_boundary.setCurrentIndex(self.lattice_boundary.findData("periodic"))
+        self.lattice_boundary.setEnabled(not height_mode)
+        self._update_box_size()
 
     def _apply_lattice(self) -> None:
         self.lattice_callback(
+            self.geometry.currentData(), self.lattice_boundary.currentData(),
             self.nx.value(), self.ny.value(), self.lattice_constant.value(),
             self.trap_separation.value(), self.trap_height.value(), self.trap_stiffness.value(),
+            self.height_offset.value(),
         )
 
     def _apply_configuration(self) -> None:
@@ -1276,6 +1461,8 @@ class MainWindow(QMainWindow):
         self.save_action = self._action("Save", self.save_project, QKeySequence.StandardKey.Save)
         self.import_action = self._action("Import state", self.import_csv)
         self.trajectory_action = self._action("Open trajectory", self.open_trajectory)
+        self.export_video_action = self._action("Export trajectory video…", self.export_trajectory_video)
+        self.export_video_action.setEnabled(False)
         self.export_action = self._action("Export CSV", self.export_csv)
         self.flip_action = self._action("Flip selected", self.flip_selected, QKeySequence("F"))
         self.fit_action = self._action("Fit", self.fit_scene, QKeySequence("0"))
@@ -1301,6 +1488,7 @@ class MainWindow(QMainWindow):
         self.save_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.import_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowDown))
         self.trajectory_action.setIcon(icon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.export_video_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogSaveButton))
         self.undo_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowBack))
         self.redo_action.setIcon(icon(QStyle.StandardPixmap.SP_ArrowForward))
         self.validate_action.setIcon(icon(QStyle.StandardPixmap.SP_DialogApplyButton))
@@ -1313,7 +1501,7 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         for action in (self.new_action, self.open_action, self.save_action, None,
                        self.import_action, self.trajectory_action, self.export_action,
-                       self.export_image_action, self.copy_image_action):
+                       self.export_video_action, self.export_image_action, self.copy_image_action):
             file_menu.addSeparator() if action is None else file_menu.addAction(action)
         edit_menu = self.menuBar().addMenu("&Edit")
         for action in (self.undo_action, self.redo_action, None, self.flip_action):
@@ -1355,6 +1543,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         for action in (self.import_action, self.trajectory_action):
             toolbar.addAction(action)
+        toolbar.addAction(self.export_video_action)
         toolbar.addSeparator()
         for action in (self.undo_action, self.redo_action):
             toolbar.addAction(action)
@@ -1449,12 +1638,13 @@ class MainWindow(QMainWindow):
         if self.charge_mode == "Off":
             return
         radius = max(self.document.trap_separation * 0.40, 0.5)
-        for ix, iy, x, y, q in periodic_vertex_data(self.document):
+        self.view.charge_values = _charge_values(self.document)
+        for vertex, x, y, q, coordination in vertex_data(self.document):
             if self.charge_mode == "Nonzero" and q == 0:
                 continue
             item = ChargeItem(q, radius)
             item.setPos(x, -y)
-            item.setToolTip(f"periodic vertex ({ix}, {iy}) | q = {q:+d} = N_in - N_out")
+            item.setToolTip(f"vertex {vertex} | coordination {coordination} | q = {q:+d} = N_in - N_out")
             self.scene.addItem(item)
             self.charge_items.append(item)
 
@@ -1462,13 +1652,11 @@ class MainWindow(QMainWindow):
         if self.boundary_item is not None and self.boundary_item.scene() is self.scene:
             self.scene.removeItem(self.boundary_item)
         self.boundary_item = None
-        if (self.document.geometry != "square" or self.document.nx is None
-                or self.document.ny is None or self.document.lattice_constant is None):
+        points = _boundary_points(self.document)
+        if not points:
             return
-        lx = self.document.nx * self.document.lattice_constant
-        ly = self.document.ny * self.document.lattice_constant
         width = max(self.document.trap_separation * 0.055, 0.035)
-        self.boundary_item = BoundaryItem(QRectF(0, -ly, lx, ly), width)
+        self.boundary_item = BoundaryItem(points, width)
         self.scene.addItem(self.boundary_item)
 
     def apply_overlays(self, *unused) -> None:
@@ -1524,10 +1712,13 @@ class MainWindow(QMainWindow):
         self.update_energy()
 
     def apply_lattice_parameters(
-        self, nx: int, ny: int, lattice_constant: float, trap_separation: float,
-        trap_height: float, trap_stiffness: float,
+        self, geometry: str, boundary: str, nx: int, ny: int,
+        lattice_constant: float, trap_separation: float,
+        trap_height: float, trap_stiffness: float, height_offset: float,
     ) -> None:
-        same_shape = (nx, ny) == (self.document.nx, self.document.ny)
+        same_shape = (geometry, boundary, nx, ny) == (
+            self.document.geometry, self.document.boundary, self.document.nx, self.document.ny,
+        )
         if not same_shape:
             answer = QMessageBox.question(
                 self, "Rebuild lattice",
@@ -1538,7 +1729,9 @@ class MainWindow(QMainWindow):
                 self.parameter_panel.set_document(self.document)
                 return
 
-        replacement = periodic_square(nx, ny, lattice_constant, trap_separation)
+        replacement = create_lattice(
+            geometry, nx, ny, lattice_constant, trap_separation, boundary, height_offset,
+        )
         replacement.name = self.document.name
         replacement.energy_parameters = dict(self.document.energy_parameters)
         replacement.trap_height_pn_nm = trap_height
@@ -1576,6 +1769,7 @@ class MainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self, "Export canvas image", f"{suggested_name}.png",
             "PNG image (*.png);;SVG vector image (*.svg)",
+            options=QFileDialog.Option(0),
         )
         if not filename:
             return
@@ -1651,7 +1845,7 @@ class MainWindow(QMainWindow):
 
     def update_status(self) -> None:
         selected = len([item for item in self.scene.selectedItems() if isinstance(item, TrapItem)])
-        charge = periodic_vertex_charges(self.document); charge_text = ""
+        charge = vertex_charges(self.document); charge_text = ""
         if charge is not None:
             unique, counts = np.unique(charge, return_counts=True)
             charge_text = " | vertices " + ", ".join(
@@ -1715,7 +1909,8 @@ class MainWindow(QMainWindow):
         try:
             function = (
                 SQUARE_CONFIGURATIONS[name]
-                if name in SQUARE_CONFIGURATIONS else randomized
+                if name in SQUARE_CONFIGURATIONS else
+                polarized if name == "Polarized" else randomized
             )
             values = function(self.document)
             self.push_state_change(
@@ -1748,11 +1943,72 @@ class MainWindow(QMainWindow):
 
     def open_trajectory(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Open trajectory", "", "CSV trajectories (*.csv)"
+            self, "Open trajectory", "", "CSV trajectories (*.csv)",
+            options=QFileDialog.Option(0),
         )
         if not filename:
             return
         self._open_trajectory_path(filename)
+
+    def export_trajectory_video(self) -> None:
+        session = self.trajectory_session
+        if session is None:
+            QMessageBox.information(self, "No trajectory", "Open a trajectory before exporting video.")
+            return
+        dialog = VideoExportDialog(session.source.metadata.frame_count, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        try:
+            options.validated(session.source.metadata.frame_count)
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid video settings", str(error)); return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export trajectory video", f"{session.source.path.stem}.mp4",
+            "MP4 video (*.mp4)", options=QFileDialog.Option(0),
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        document = IceDocument.from_dict(self.document.to_dict())
+        cancel_event = Event()
+        progress = QProgressDialog("Rendering trajectory video…", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Exporting video")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setAutoClose(False); progress.setAutoReset(False); progress.setMinimumDuration(0)
+        progress.canceled.connect(cancel_event.set); progress.show()
+        started = perf_counter()
+
+        def update_progress(value: int) -> None:
+            progress.setValue(value)
+            elapsed = perf_counter() - started
+            remaining = elapsed * (100 - value) / value if value else 0
+            detail = f"{elapsed:.0f}s elapsed"
+            if value: detail += f" · about {remaining:.0f}s remaining"
+            progress.setLabelText(f"Rendering trajectory video…\n{detail}")
+
+        def render(signals):
+            return export_trajectory_video(
+                session.source, document, destination, options,
+                progress=signals.progress.emit, cancelled=cancel_event,
+            )
+
+        def finished(result) -> None:
+            progress.close()
+            self.status.setText(f"  Exported {result.rendered_frames:,} video frames to {result.path.name}")
+            QMessageBox.information(
+                self, "Video exported",
+                f"Rendered {result.rendered_frames:,} frames.\n\n{result.path}",
+            )
+
+        def failed(message: str) -> None:
+            progress.close()
+            if cancel_event.is_set():
+                self.status.setText("  Video export cancelled")
+            else:
+                QMessageBox.critical(self, "Could not export video", message)
+
+        self._run_worker(render, finished, failed, update_progress)
 
     def _open_trajectory_path(self, filename: str) -> None:
         self._leave_trajectory_mode()
@@ -1783,6 +2039,7 @@ class MainWindow(QMainWindow):
             pane.hide_progress(); pane.set_metadata(source.metadata)
             self.playback.configure(source.metadata.frame_count)
             self.mode_badge.setText(" TRAJECTORY ")
+            self.export_video_action.setEnabled(True)
             self.flip_action.setEnabled(False)
             self.undo_action.setEnabled(False); self.redo_action.setEnabled(False)
             self.parameter_panel.set_trajectory_mode(True)
@@ -1880,9 +2137,9 @@ class MainWindow(QMainWindow):
         self.current_trajectory_position = position
         entry = session.source.metadata.frames[position]
         self.playback.show_position(position, entry.value, entry.time)
-        current_text = f"frame {entry.value}"
+        current_text = f"frame {compact_trajectory_value(entry.value)}"
         if entry.time is not None:
-            current_text += f" · t={entry.time}"
+            current_text += f" · t={compact_trajectory_value(entry.time)}"
         self.parameter_panel.trajectory_pane.set_current(current_text)
         self.rebuild_trail_overlay()
         diagnostics = self.parameter_panel.trajectory_pane.diagnostics.currentText()
@@ -1995,10 +2252,10 @@ class MainWindow(QMainWindow):
                 return
             if action == "mark_a":
                 self.comparison_a = snapshot
-                pane.set_marker("a", f"frame {snapshot.frame_value}")
+                pane.set_marker("a", f"frame {compact_trajectory_value(snapshot.frame_value)}")
             else:
                 self.comparison_b = snapshot
-                pane.set_marker("b", f"frame {snapshot.frame_value}")
+                pane.set_marker("b", f"frame {compact_trajectory_value(snapshot.frame_value)}")
             if self.comparison_a is not None and self.comparison_b is not None:
                 pane.show.setChecked(True)
         elif action == "jump_a" and self.comparison_a is not None:
@@ -2109,6 +2366,8 @@ class MainWindow(QMainWindow):
             self.flip_action.setEnabled(True)
         if hasattr(self, "mode_badge"):
             self.mode_badge.setText(" STATE ")
+        if hasattr(self, "export_video_action"):
+            self.export_video_action.setEnabled(False)
 
     def set_document(self, document: IceDocument, path: Path | None = None) -> None:
         self._leave_trajectory_mode()
@@ -2120,7 +2379,10 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted: self.set_document(dialog.create_document())
 
     def open_project(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(self, "Open project", "", "ACI projects (*.aci.json *.json)")
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Open project", "", "ACI projects (*.aci.json *.json)",
+            options=QFileDialog.Option(0),
+        )
         if filename:
             try: self.set_document(IceDocument.load(filename), Path(filename))
             except Exception as error: QMessageBox.critical(self, "Could not open project", str(error))
@@ -2128,11 +2390,17 @@ class MainWindow(QMainWindow):
     def save_project(self) -> None:
         filename = str(self.project_path) if self.project_path else ""
         if not filename:
-            filename, _ = QFileDialog.getSaveFileName(self, "Save project", "state.aci.json", "ACI projects (*.aci.json)")
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Save project", "state.aci.json", "ACI projects (*.aci.json)",
+                options=QFileDialog.Option(0),
+            )
         if filename: self.document.save(filename); self.project_path = Path(filename)
 
     def import_csv(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(self, "Import state CSV", "", "CSV files (*.csv)")
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Import state CSV", "", "CSV files (*.csv)",
+            options=QFileDialog.Option(0),
+        )
         if not filename: return
         try:
             with Path(filename).open("r", encoding="utf-8-sig", newline="") as stream:
@@ -2149,7 +2417,10 @@ class MainWindow(QMainWindow):
         if issues: QMessageBox.warning(self, "Imported with warnings", "\n".join(issues[:20]))
 
     def export_csv(self) -> None:
-        filename, _ = QFileDialog.getSaveFileName(self, "Export state CSV", f"{self.document.name}.csv", "CSV files (*.csv)")
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export state CSV", f"{self.document.name}.csv", "CSV files (*.csv)",
+            options=QFileDialog.Option(0),
+        )
         if not filename: return
         choice = QMessageBox.question(
             self, "Canonical export", "Normalize directions and place every colloid at an ideal well?\n\n"
@@ -2165,6 +2436,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    configure_desktop_integration()
     application = QApplication(sys.argv); application.setApplicationName("ACI State Builder")
     window = MainWindow(); window.show(); return application.exec()
 

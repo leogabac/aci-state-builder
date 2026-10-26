@@ -25,8 +25,10 @@ def validate(document: IceDocument) -> list[str]:
                 issues.append(f"Trap {trap.id} has a non-finite colloid displacement.")
             elif np.dot(trap.displacement, trap.direction) < -1e-9:
                 issues.append(f"Trap {trap.id} has direction and displacement pointing oppositely.")
-    if document.nx is not None and document.ny is not None:
-        expected = 2 * document.nx * document.ny
-        if document.geometry == "square" and document.boundary == "periodic" and len(ids) != expected:
-            issues.append(f"Periodic square metadata expects {expected} traps, found {len(ids)}.")
+    if document.trap_vertices and len(document.trap_vertices) != len(document.traps):
+        issues.append("Topology edge metadata does not match the trap count.")
+    if document.vertex_coordination and len(document.vertex_coordination) != len(document.vertex_positions):
+        issues.append("Topology coordination metadata does not match the vertex count.")
+    if document.boundary == "periodic" and document.geometry != "custom" and len(document.cell_vectors) != 2:
+        issues.append("Generated periodic lattice has no valid primitive cell.")
     return issues

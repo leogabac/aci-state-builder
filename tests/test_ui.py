@@ -3,6 +3,9 @@ import os
 import tempfile
 import time
 import unittest
+import shutil
+from threading import Thread
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,7 +14,13 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 
-from aci_state_builder.app import MainWindow
+from aci_state_builder.app import (
+    MainWindow, PlaybackBar, compact_trajectory_value, configure_desktop_integration,
+)
+from aci_state_builder.geometry import create_lattice
+from aci_state_builder.formats import document_from_frame
+from aci_state_builder.trajectory import IndexedCsvTrajectory
+from aci_state_builder.video import VideoExportOptions, export_trajectory_video
 
 
 class TrajectoryUiTests(unittest.TestCase):
@@ -28,6 +37,65 @@ class TrajectoryUiTests(unittest.TestCase):
                 return True
             time.sleep(0.005)
         return False
+
+    def test_trajectory_values_are_compact_without_losing_exact_tooltip(self) -> None:
+        self.assertEqual(compact_trajectory_value("0.30000000000000004"), "0.3")
+        self.assertEqual(compact_trajectory_value("1.234567890123"), "1.234568")
+        self.assertEqual(compact_trajectory_value("0.000000123456789"), "1.234568e-7")
+        self.assertEqual(compact_trajectory_value("000042"), "000042")
+        self.assertEqual(compact_trajectory_value("equilibrated"), "equilibrated")
+
+        bar = PlaybackBar(lambda position: None, lambda: None)
+        bar.configure(12)
+        bar.show_position(2, "0.30000000000000004", "1.234567890123")
+        self.assertEqual(bar.position.text(), "Frame 0.3  (3/12)")
+        self.assertEqual(bar.position.toolTip(), "Exact frame value: 0.30000000000000004")
+        self.assertEqual(bar.time.text(), "t = 1.234568")
+        self.assertEqual(bar.time.toolTip(), "Exact time value: 1.234567890123")
+
+    def test_kde_launch_uses_the_bundled_portal_file_chooser(self) -> None:
+        environment = {"XDG_CURRENT_DESKTOP": "KDE"}
+        with patch.dict(os.environ, environment, clear=True):
+            configure_desktop_integration()
+            self.assertEqual(os.environ["QT_QPA_PLATFORMTHEME"], "xdgdesktopportal")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is not installed")
+    def test_direct_video_export_streams_selected_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / "trajectory.csv"
+            lines = ["frame,id,x,y,z,dx,dy,dz,t,cx,cy,cz"]
+            for frame in range(5):
+                for particle in range(4):
+                    lines.append(
+                        f"{frame},{particle},{particle * 4},0,0,1,0,0,{frame * .25},"
+                        f"{.5 + frame * .05},0,0"
+                    )
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            source = IndexedCsvTrajectory(path, cache_directory=root / "cache")
+            document = document_from_frame(source.load_frame(0), name="Video test")
+            output = root / "result.mp4"
+            progress = []
+            results, errors = [], []
+            def run_export() -> None:
+                try:
+                    results.append(export_trajectory_video(
+                        source, document, output,
+                        VideoExportOptions(
+                            start=0, stop=4, stride=2, fps=12, width=320, height=240,
+                            quality="draft", trail_length=2,
+                        ),
+                        progress=progress.append,
+                    ))
+                except Exception as error:
+                    errors.append(error)
+            worker = Thread(target=run_export); worker.start(); worker.join(10)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            result = results[0]
+            self.assertEqual(result.rendered_frames, 3)
+            self.assertGreater(output.stat().st_size, 1000)
+            self.assertEqual(progress[-1], 100)
+            self.assertFalse((root / "result.part.mp4").exists())
 
     def test_async_open_and_frame_change_reuse_graphics_items(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -63,6 +131,7 @@ class TrajectoryUiTests(unittest.TestCase):
                 self.assertEqual(window.playback.slider.value(), 3)
                 self.assertFalse(window.parameter_panel.trajectory_pane.isHidden())
                 self.assertEqual(window.mode_badge.text().strip(), "TRAJECTORY")
+                self.assertTrue(window.export_video_action.isEnabled())
                 self.assertIsNotNone(window.comparison_item)
                 self.assertEqual(window.comparison_a.position, 0)
                 self.assertEqual(window.comparison_b.position, 3)
@@ -180,6 +249,22 @@ class TrajectoryUiTests(unittest.TestCase):
         finally:
             window.close()
             QApplication.setPalette(original)
+
+    def test_topology_controls_and_oblique_overlays(self) -> None:
+        window = MainWindow()
+        try:
+            document = create_lattice("honeycomb", 4, 3, 8.0, 3.0)
+            window.set_document(document)
+            panel = window.parameter_panel
+            self.assertEqual(panel.geometry.currentData(), "honeycomb")
+            self.assertEqual(panel.lattice_boundary.currentData(), "periodic")
+            self.assertEqual([panel.configuration.itemText(i) for i in range(panel.configuration.count())], ["Polarized", "Randomize"])
+            self.assertIsNotNone(window.boundary_item)
+            window.set_charge_mode("All")
+            self.assertEqual(len(window.charge_items), len(document.vertex_positions))
+            self.assertEqual(window.view.charge_values, (-3, -1, 1, 3))
+        finally:
+            window.close()
 
 
 if __name__ == "__main__":

@@ -68,10 +68,18 @@ def document_from_frame(table: pl.DataFrame, *, name: str = "Untitled") -> IceDo
             raise StateFormatError(f"invalid row for trap {row.get('id', '?')}: {error}") from error
     lengths = [float(np.linalg.norm(trap.displacement)) for trap in traps]
     nonzero = [value for value in lengths if value > 1e-12]
-    return IceDocument(
+    document = IceDocument(
         traps=traps, trap_separation=2 * float(np.median(nonzero)) if nonzero else 3.0,
         name=name, source_columns=list(table.columns), **_infer_square_metadata(traps),
     )
+    if document.geometry == "square" and document.nx and document.ny and document.lattice_constant:
+        from .geometry import periodic_square
+        generated = periodic_square(document.nx, document.ny, document.lattice_constant, document.trap_separation)
+        document.cell_vectors = generated.cell_vectors
+        document.vertex_positions = generated.vertex_positions
+        document.trap_vertices = generated.trap_vertices
+        document.vertex_coordination = generated.vertex_coordination
+    return document
 
 
 def read_csv(path: str | Path) -> IceDocument:

@@ -94,7 +94,7 @@ def colloid_positions(document: IceDocument) -> np.ndarray:
 
 def geometric_dipole_sum_pbc(
     positions_um: np.ndarray,
-    box_um: tuple[float, float],
+    box_um: tuple[float, float] | np.ndarray,
     field_colatitude_deg: float = 90.0,
     field_azimuth_deg: float = 0.0,
     cutoff_um: float = 0.0,
@@ -107,8 +107,18 @@ def geometric_dipole_sum_pbc(
     if len(positions) < 2:
         return 0.0
     box = np.asarray(box_um, dtype=float)
-    if box.shape != (2,) or np.any(~np.isfinite(box)) or np.any(box <= 0):
-        raise ValueError("PBC box lengths must be positive and finite")
+    if box.shape == (2,):
+        if np.any(~np.isfinite(box)) or np.any(box <= 0):
+            raise ValueError("PBC box lengths must be positive and finite")
+        cell = np.diag(box)
+    elif box.shape == (2, 2):
+        if np.any(~np.isfinite(box)) or abs(np.linalg.det(box)) < 1e-12:
+            raise ValueError("PBC cell vectors must be finite and non-singular")
+        cell = box
+    else:
+        raise ValueError("PBC box must be two lengths or two cell vectors")
+    inverse_cell = np.linalg.inv(cell)
+    orthogonal = abs(cell[0, 1]) < 1e-12 and abs(cell[1, 0]) < 1e-12
     theta = np.deg2rad(field_colatitude_deg)
     phi = np.deg2rad(field_azimuth_deg)
     field_hat = np.asarray([
@@ -122,7 +132,19 @@ def geometric_dipole_sum_pbc(
     # Blocks bound peak memory while leaving the pair arithmetic in compiled NumPy loops.
     for start in range(0, len(positions), block_size):
         delta = positions[start:start + block_size, None, :] - positions[None, :, :]
-        delta[..., :2] -= box * np.rint(delta[..., :2] / box)
+        fractional = delta[..., :2] @ inverse_cell
+        base = np.rint(fractional)
+        if orthogonal:
+            delta[..., :2] = (fractional - base) @ cell
+        else:
+            # For an oblique cell, independently rounded fractional coordinates
+            # are not always the nearest image. Check its eight neighbors.
+            candidates = np.stack([
+                (fractional - base - (i, j)) @ cell
+                for i in (-1, 0, 1) for j in (-1, 0, 1)
+            ], axis=-2)
+            nearest = np.argmin(np.einsum("...ki,...ki->...k", candidates, candidates), axis=-1)
+            delta[..., :2] = np.take_along_axis(candidates, nearest[..., None, None], axis=-2)[..., 0, :]
         r2 = np.einsum("ijk,ijk->ij", delta, delta)
         mask = r2 > 0
         if cutoff_um > 0:
@@ -137,15 +159,13 @@ def geometric_dipole_sum_pbc(
 
 
 def calculate_energy(document: IceDocument, parameters: EnergyParameters) -> EnergyResult:
-    if (document.geometry != "square" or document.boundary != "periodic"
-            or document.nx is None or document.ny is None
-            or document.lattice_constant is None):
-        raise ValueError("energy currently requires a periodic square document")
+    if document.boundary != "periodic" or not document.cell_vectors:
+        raise ValueError("energy requires a generated periodic lattice")
     started = perf_counter()
     positions = colloid_positions(document)
     geometric_sum = geometric_dipole_sum_pbc(
         positions,
-        (document.nx * document.lattice_constant, document.ny * document.lattice_constant),
+        np.asarray(document.cell_vectors, dtype=float),
         parameters.field_colatitude_deg,
         parameters.field_azimuth_deg,
         parameters.cutoff_um,

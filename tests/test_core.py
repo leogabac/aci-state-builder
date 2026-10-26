@@ -9,7 +9,9 @@ from aci_state_builder.energy import (
     EnergyParameters, calculate_energy, dipole_prefactor_pn_nm_um3,
     geometric_dipole_sum_pbc,
 )
-from aci_state_builder.geometry import periodic_square, periodic_vertex_charges
+from aci_state_builder.geometry import (
+    create_lattice, periodic_square, periodic_vertex_charges, vertex_charges,
+)
 from aci_state_builder.model import IceDocument
 from aci_state_builder.presets import (
     SQUARE_CONFIGURATIONS, four_in_four_out, randomized, two_in_two_out,
@@ -22,6 +24,31 @@ WORKSPACE = Path(__file__).resolve().parents[2]
 
 
 class GeometryTests(unittest.TestCase):
+    def test_periodic_topologies_have_expected_coordination(self) -> None:
+        expected = {
+            "square": (2 * 4 * 3, 4),
+            "honeycomb": (3 * 4 * 3, 3),
+            "triangular": (3 * 4 * 3, 6),
+        }
+        for geometry, (trap_count, coordination) in expected.items():
+            with self.subTest(geometry=geometry):
+                document = create_lattice(geometry, 4, 3, 8.0, 3.0)
+                self.assertEqual(len(document.traps), trap_count)
+                self.assertEqual(set(document.vertex_coordination), {coordination})
+                self.assertEqual(int(vertex_charges(document).sum()), 0)
+
+    def test_closed_boundaries_and_height_offset_are_generated(self) -> None:
+        for geometry in ("square", "honeycomb", "triangular"):
+            for boundary in ("closed_spin", "closed_vertex"):
+                with self.subTest(geometry=geometry, boundary=boundary):
+                    document = create_lattice(geometry, 3, 2, 8.0, 3.0, boundary)
+                    self.assertGreater(len(document.traps), 0)
+                    self.assertFalse(document.cell_vectors)
+                    self.assertEqual(len(document.trap_vertices), len(document.traps))
+        document = create_lattice("square3d", 3, 2, 8.0, 3.0, height_offset=1.25)
+        self.assertEqual(set(document.vertex_coordination), {4})
+        self.assertEqual(set(np.unique([trap.center[2] for trap in document.traps])), {0.0, 1.25})
+
     def test_historical_ordering(self) -> None:
         document = periodic_square(2, 2, 8.0, 3.0)
         self.assertEqual(len(document.traps), 8)
@@ -78,6 +105,12 @@ class GeometryTests(unittest.TestCase):
 
 
 class FormatTests(unittest.TestCase):
+    def test_non_square_topology_survives_project_round_trip(self) -> None:
+        source = create_lattice("honeycomb", 3, 4, 7.5, 2.5)
+        loaded = IceDocument.from_dict(source.to_dict())
+        self.assertEqual(loaded.to_dict(), source.to_dict())
+        self.assertEqual(set(loaded.vertex_coordination), {3})
+
     def test_canonical_csv_round_trip(self) -> None:
         source = periodic_square(4, 4, 8.0, 3.0)
         source.set_occupancies(two_in_two_out(source))
@@ -151,6 +184,9 @@ class TrajectoryTests(unittest.TestCase):
             document = document_from_frame(chunk.frame(2), name="trajectory")
             self.assertEqual(document.name, "trajectory")
             self.assertEqual(document.traps[0].occupancy, 1)
+            direct = source.load_frame(1)
+            self.assertEqual(direct.get_column("frame").unique().to_list(), [20])
+            self.assertEqual(direct.height, 2)
 
     def test_session_cache_is_bounded_and_reconfigurable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -179,6 +215,19 @@ class TrajectoryTests(unittest.TestCase):
 
 
 class EnergyTests(unittest.TestCase):
+    def test_oblique_cell_minimum_image_is_translation_invariant(self) -> None:
+        cell = np.asarray([[10.0, 0.0], [5.0, 5 * np.sqrt(3)]])
+        positions = np.asarray([[1.0, 1.0, 0.0], [3.0, 2.0, 0.0]])
+        reference = geometric_dipole_sum_pbc(positions, cell, 90, 31)
+        translated = positions.copy(); translated[1, :2] += cell[1]
+        self.assertAlmostEqual(geometric_dipole_sum_pbc(translated, cell, 90, 31), reference)
+
+    def test_energy_is_available_for_all_periodic_topologies(self) -> None:
+        for geometry in ("square", "honeycomb", "triangular", "square3d"):
+            with self.subTest(geometry=geometry):
+                document = create_lattice(geometry, 2, 2, 8.0, 3.0, height_offset=1.0)
+                self.assertTrue(np.isfinite(calculate_energy(document, EnergyParameters()).total_pn_nm))
+
     def test_two_particle_energy_and_minimum_image(self) -> None:
         positions = np.array([[0.5, 0, 0], [9.5, 0, 0]])
         # They are one micrometre apart through the periodic x seam and parallel to B.

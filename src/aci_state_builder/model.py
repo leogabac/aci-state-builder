@@ -93,6 +93,11 @@ class IceDocument:
     units: str = "um"
     name: str = "Untitled"
     source_columns: list[str] = field(default_factory=list)
+    cell_vectors: list[list[float]] = field(default_factory=list)
+    vertex_positions: list[list[float]] = field(default_factory=list)
+    trap_vertices: list[list[int | None]] = field(default_factory=list)
+    vertex_coordination: list[int] = field(default_factory=list)
+    height_offset: float = 0.0
     energy_parameters: dict[str, float] = field(default_factory=lambda: {
         "particle_radius_um": 1.4,
         "susceptibility": 0.4,
@@ -101,7 +106,7 @@ class IceDocument:
         "field_azimuth_deg": 0.0,
         "cutoff_um": 0.0,
     })
-    version: int = 1
+    version: int = 2
 
     def flip_indices(self, indices: Iterable[int]) -> None:
         for index in indices:
@@ -141,6 +146,11 @@ class IceDocument:
             "trap_height_pn_nm": self.trap_height_pn_nm,
             "trap_stiffness_pn_per_nm": self.trap_stiffness_pn_per_nm,
             "source_columns": self.source_columns,
+            "cell_vectors": self.cell_vectors,
+            "vertex_positions": self.vertex_positions,
+            "trap_vertices": self.trap_vertices,
+            "vertex_coordination": self.vertex_coordination,
+            "height_offset": self.height_offset,
             "energy_parameters": self.energy_parameters,
             "traps": [trap.to_dict() for trap in self.traps],
         }
@@ -161,7 +171,19 @@ class IceDocument:
             parameters.setdefault("field_azimuth_deg", parameters["field_angle_deg"])
             parameters.pop("field_angle_deg")
             fields["energy_parameters"] = parameters
-        return cls(**fields)
+        document = cls(**fields)
+        if (not document.trap_vertices and document.geometry == "square"
+                and document.boundary == "periodic" and document.nx and document.ny
+                and document.lattice_constant):
+            from .geometry import periodic_square
+            generated = periodic_square(
+                document.nx, document.ny, document.lattice_constant, document.trap_separation,
+            )
+            document.cell_vectors = generated.cell_vectors
+            document.vertex_positions = generated.vertex_positions
+            document.trap_vertices = generated.trap_vertices
+            document.vertex_coordination = generated.vertex_coordination
+        return document
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n", encoding="utf-8")

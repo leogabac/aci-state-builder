@@ -1,6 +1,6 @@
 # ACI State Builder
 
-A desktop editor for creating and inspecting artificial colloidal ice states. The first version focuses on periodic square ice and the compact CSV format used by `icenumerics` and the historical `stuckgs` simulations.
+A desktop editor for creating and inspecting artificial colloidal ice states, using the compact CSV format from `icenumerics` and the historical `stuckgs` simulations.
 
 ## Run
 
@@ -19,7 +19,9 @@ rpy run aci-state-builder
 
 ## First-version features
 
-- Generate rectangular periodic square lattices.
+- Generate square, honeycomb/kagome-ice, triangular, and height-offset square
+  lattices, with periodic or finite closed-spin/closed-vertex boundaries where
+  the geometry supports them.
 - Click a trap to flip its colloid; Shift/Ctrl-click selects without flipping.
 - Rubber-band select traps and press `F` to flip the selection.
 - Apply square-lattice polarized, 2-in/2-out, and 4-in/4-out configurations,
@@ -38,8 +40,9 @@ rpy run aci-state-builder
   highlighting, and a compact qualitative change summary.
 - Export either canonical `icenumerics` CSVs or round-trip legacy CSVs.
 - Save richer, versioned `.aci.json` project files.
-- Display periodic topological charges `q = N_in - N_out` as either nonzero-only
-  or all-vertex overlays, with modulo wrapping across both PBC seams.
+- Display topology-aware charges `q = N_in - N_out` as either nonzero-only or
+  all-vertex overlays, including odd coordination on honeycomb ice and oblique
+  periodic seams.
 - Display live charge counts and validate states.
 - Independently toggle trap bodies, particles, IDs, periodic boundaries,
   charges, charge legend, and a zoom-aware physical scale bar.
@@ -49,6 +52,9 @@ rpy run aci-state-builder
 - Switch to a canvas-only presentation mode, copy the canvas to the clipboard,
   or export the current view (and either side of a comparison) as scaled PNG or
   SVG with the active visual overlays.
+- Export trajectories directly to H.264 MP4 at a chosen FPS, frame stride,
+  resolution, quality, and light/dark presentation style, with optional charges
+  and trails plus cancellable progress and no temporary frame images.
 - Use a persistent right-hand parameter pane for lattice dimensions and spacing,
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.
@@ -61,6 +67,8 @@ than beside the simulation data. The first opening scans a CSV once; later
 openings seek directly to the required frame blocks. The reader, cache, and UI
 are deliberately separated so a native Parquet backend can be added later
 without changing trajectory playback or analysis controls.
+
+Video export requires `ffmpeg` on `PATH`; no Python video package is required.
 
 ## Tests
 
