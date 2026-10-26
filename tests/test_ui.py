@@ -15,7 +15,8 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 
 from aci_state_builder.app import (
-    MainWindow, PlaybackBar, compact_trajectory_value, configure_desktop_integration,
+    MainWindow, PlaybackBar, VideoExportDialog, compact_trajectory_value,
+    configure_desktop_integration,
 )
 from aci_state_builder.geometry import create_lattice
 from aci_state_builder.formats import document_from_frame
@@ -96,6 +97,23 @@ class TrajectoryUiTests(unittest.TestCase):
             self.assertGreater(output.stat().st_size, 1000)
             self.assertEqual(progress[-1], 100)
             self.assertFalse((root / "result.part.mp4").exists())
+
+    def test_video_dialog_defaults_to_tikz_presentation(self) -> None:
+        dialog = VideoExportDialog(101)
+        dialog.stride.setValue(10); dialog.fps.setValue(25)
+        options = dialog.options()
+        self.assertEqual(options.theme, "tikz")
+        self.assertTrue(options.show_charges)
+        self.assertEqual(options.charge_style, "cells")
+        self.assertEqual(options.charge_palette, "blue_ivory_red")
+        self.assertEqual(dialog.charge_palette.itemText(0), "Default")
+        self.assertEqual(dialog.charge_palette.itemText(1), "LA/AO PRR Paper")
+        self.assertFalse(dialog.charge_palette.itemIcon(0).isNull())
+        self.assertFalse(dialog.charge_palette.itemIcon(1).isNull())
+        dialog.charge_palette.setCurrentIndex(dialog.charge_palette.findData("paper_charge_magnitude"))
+        self.assertEqual(dialog.options().charge_palette, "paper_charge_magnitude")
+        self.assertEqual(list(options.positions()), list(range(0, 101, 10)))
+        self.assertIn("11 rendered frames", dialog.summary.text())
 
     def test_async_open_and_frame_change_reuse_graphics_items(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

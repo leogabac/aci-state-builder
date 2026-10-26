@@ -29,6 +29,8 @@ class VideoExportOptions:
     show_traps: bool = True
     show_boundary: bool = True
     show_charges: bool = False
+    charge_style: str = "circles"
+    charge_palette: str = "blue_ivory_red"
     trail_length: int = 0
 
     def positions(self) -> range:
@@ -43,10 +45,14 @@ class VideoExportOptions:
             raise ValueError("video resolution is too small")
         if self.width % 2 or self.height % 2:
             raise ValueError("video width and height must be even")
-        if self.theme not in ("dark", "light"):
+        if self.theme not in ("dark", "light", "tikz"):
             raise ValueError("unknown video theme")
         if self.quality not in ("draft", "balanced", "high"):
             raise ValueError("unknown video quality")
+        if self.charge_style not in ("circles", "cells"):
+            raise ValueError("unknown vertex display style")
+        if self.charge_palette not in ("blue_ivory_red", "paper_charge_magnitude"):
+            raise ValueError("unknown charge palette")
         return self
 
 
@@ -82,13 +88,29 @@ class ScientificVideoRenderer:
         self.document = document
         self.options = options
         self.dark = options.theme == "dark"
-        self.background = QColor("#101419" if self.dark else "#fafbfc")
-        self.foreground = QColor("#edf1f4" if self.dark else "#20252b")
-        self.muted = QColor("#77838e" if self.dark else "#aab2b9")
-        self.trap_fill = QColor("#26313a" if self.dark else "#eef1f3")
-        self.particle = QColor("#f6c85f" if self.dark else "#15191d")
-        self.negative = QColor("#66a8dc")
-        self.positive = QColor("#ed8177")
+        self.tikz = options.theme == "tikz"
+        if self.tikz:
+            self.background = QColor("#fffdf7")
+            self.foreground = QColor("#292522")
+            self.muted = QColor("#8a8179")
+            self.trap_fill = QColor("#d9d8d3")
+            self.trap_outline = QColor("#686763")
+            self.particle = QColor("#b33b2e")
+            self.negative = QColor("#496f9e")
+            self.positive = QColor("#b65349")
+            self.boundary_color = QColor("#56514c")
+            self.font_family = "DejaVu Serif"
+        else:
+            self.background = QColor("#101419" if self.dark else "#fafbfc")
+            self.foreground = QColor("#edf1f4" if self.dark else "#20252b")
+            self.muted = QColor("#77838e" if self.dark else "#aab2b9")
+            self.trap_fill = QColor("#26313a" if self.dark else "#eef1f3")
+            self.trap_outline = QColor("#77838e" if self.dark else "#7c858c")
+            self.particle = QColor("#f6c85f" if self.dark else "#15191d")
+            self.negative = QColor("#66a8dc")
+            self.positive = QColor("#ed8177")
+            self.boundary_color = QColor("#55a9e8")
+            self.font_family = "Sans Serif"
         self.margin = max(document.trap_separation * 1.35, 1.0)
         points = np.asarray([trap.center[:2] for trap in document.traps], dtype=float)
         if document.cell_vectors:
@@ -105,12 +127,16 @@ class ScientificVideoRenderer:
         self.offset_x = (options.width - drawn_w) / 2
         self.offset_y = (options.height - drawn_h) / 2 + 18
         self.static = self._static_layer()
+        self.trap_layer = self._trap_layer()
 
     def point(self, x: float, y: float) -> QPointF:
         return QPointF(
             self.offset_x + (x - self.minimum[0]) * self.scale,
             self.offset_y + (self.maximum[1] - y) * self.scale,
         )
+
+    def unit_label(self) -> str:
+        return "μm" if self.document.units == "um" else self.document.units
 
     def _peanut(self, half: float, radius: float) -> QPainterPath:
         waist = radius * .40
@@ -133,21 +159,13 @@ class ScientificVideoRenderer:
         if self.options.show_boundary and len(self.document.cell_vectors) == 2:
             a, b = np.asarray(self.document.cell_vectors, dtype=float)
             polygon = [(0, 0), a, a + b, b, (0, 0)]
-            painter.setPen(QPen(QColor("#55a9e8"), 2, Qt.PenStyle.DashLine))
+            boundary_style = Qt.PenStyle.SolidLine if self.tikz else Qt.PenStyle.DashLine
+            painter.setPen(QPen(self.boundary_color, 1.25 if self.tikz else 2, boundary_style))
             for first, second in zip(polygon, polygon[1:]):
                 painter.drawLine(self.point(*first), self.point(*second))
-        if self.options.show_traps:
-            half = self.document.trap_separation * self.scale / 2
-            radius = max(self.document.trap_separation * .22 * self.scale, 2.0)
-            peanut = self._peanut(half, radius)
-            for trap in self.document.traps:
-                painter.save(); painter.translate(self.point(trap.center[0], trap.center[1]))
-                painter.rotate(math.degrees(math.atan2(-trap.axis[1], trap.axis[0])))
-                fill = QColor(self.trap_fill)
-                if abs(float(trap.center[2])) > 1e-12:
-                    fill = QColor("#314b62" if self.dark else "#dcebf6")
-                painter.setPen(QPen(self.muted, max(1.0, radius * .10)))
-                painter.setBrush(QBrush(fill)); painter.drawPath(peanut); painter.restore()
+            if self.tikz:
+                painter.setBrush(QBrush(self.boundary_color)); painter.setPen(Qt.PenStyle.NoPen)
+                for vertex in polygon[:-1]: painter.drawEllipse(self.point(*vertex), 2.2, 2.2)
         raw_scale = (self.maximum[0] - self.minimum[0]) * .14
         decade = 10 ** math.floor(math.log10(max(raw_scale, 1e-12)))
         scaled = raw_scale / decade
@@ -158,8 +176,48 @@ class ScientificVideoRenderer:
         painter.drawLine(QPointF(30, scale_y), QPointF(30 + scale_pixels, scale_y))
         painter.drawLine(QPointF(30, scale_y - 5), QPointF(30, scale_y + 5))
         painter.drawLine(QPointF(30 + scale_pixels, scale_y - 5), QPointF(30 + scale_pixels, scale_y + 5))
-        painter.setFont(QFont("Sans Serif", max(9, self.options.height // 90)))
-        painter.drawText(QPointF(30, scale_y - 9), f"{scale_length:g} {self.document.units}")
+        painter.setFont(QFont(self.font_family, max(9, self.options.height // 90)))
+        painter.drawText(QPointF(30, scale_y - 9), f"{scale_length:g} {self.unit_label()}")
+        if self.tikz:
+            painter.setPen(QPen(self.muted, 1))
+            painter.drawLine(QPointF(30, 66), QPointF(self.options.width - 30, 66))
+            axis_origin = QPointF(self.options.width - 78, self.options.height - 34)
+            painter.setPen(QPen(self.foreground, 1.2))
+            painter.drawLine(axis_origin, axis_origin + QPointF(28, 0))
+            painter.drawLine(axis_origin, axis_origin + QPointF(0, -28))
+            painter.setFont(QFont(self.font_family, max(9, self.options.height // 92)))
+            painter.drawText(axis_origin + QPointF(32, 4), "x")
+            painter.drawText(axis_origin + QPointF(-3, -33), "y")
+        painter.end()
+        return image
+
+    def _trap_layer(self) -> QImage:
+        image = QImage(self.options.width, self.options.height, QImage.Format.Format_RGBA8888)
+        image.fill(Qt.GlobalColor.transparent)
+        if not self.options.show_traps:
+            return image
+        painter = QPainter(image); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        half = self.document.trap_separation * self.scale / 2
+        # The experimental grooves are broad objects, not thin spin glyphs:
+        # keep the two wells visually substantial at paper scale.
+        radius = max(self.document.trap_separation * .36 * self.scale, 2.5)
+        peanut = self._peanut(half, radius)
+        for trap in self.document.traps:
+            painter.save(); painter.translate(self.point(trap.center[0], trap.center[1]))
+            painter.rotate(math.degrees(math.atan2(-trap.axis[1], trap.axis[0])))
+            fill = QColor(self.trap_fill)
+            if abs(float(trap.center[2])) > 1e-12:
+                fill = QColor("#314b62" if self.dark else "#dcebf6")
+            painter.setPen(QPen(self.trap_outline, max(.75, radius * (.075 if self.tikz else .10))))
+            painter.setBrush(QBrush(fill)); painter.drawPath(peanut)
+            if self.tikz:
+                well = QColor(self.trap_outline); well.setAlpha(175)
+                painter.setPen(QPen(well, max(.55, radius * .045)))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(-half, 0), radius * .54, radius * .73)
+                painter.drawEllipse(QPointF(half, 0), radius * .54, radius * .73)
+                painter.drawLine(QPointF(0, -radius * .34), QPointF(0, radius * .34))
+            painter.restore()
         painter.end()
         return image
 
@@ -185,42 +243,160 @@ class ScientificVideoRenderer:
             if end is not None: charge[end] += state
         return charge
 
+    def _charge_color(self, charge: int, coordination: int) -> QColor:
+        if self.options.charge_palette == "paper_charge_magnitude":
+            # Figure 2 of Alanis-Cantú and Ortiz-Ambriz: neutral orange,
+            # intermediate cornflower blue, and deep blue for |q| = z.
+            fraction = min(abs(charge) / max(coordination, 1), 1.0)
+            low = QColor("#cd853f")
+            middle = QColor("#6495ed")
+            high = QColor("#1a1b6c")
+            if fraction <= .5:
+                first, second, mix = low, middle, fraction * 2
+            else:
+                first, second, mix = middle, high, (fraction - .5) * 2
+            color = QColor(
+                round(first.red() + (second.red() - first.red()) * mix),
+                round(first.green() + (second.green() - first.green()) * mix),
+                round(first.blue() + (second.blue() - first.blue()) * mix),
+            )
+            color.setAlpha(180 if self.tikz else 145)
+            return color
+        neutral = QColor("#eee8dc" if self.tikz else "#d8dee1")
+        target = self.positive if charge > 0 else self.negative
+        fraction = min(abs(charge) / max(coordination, 1), 1.0)
+        color = QColor(
+            round(neutral.red() + (target.red() - neutral.red()) * fraction),
+            round(neutral.green() + (target.green() - neutral.green()) * fraction),
+            round(neutral.blue() + (target.blue() - neutral.blue()) * fraction),
+        )
+        color.setAlpha(150 if self.tikz else 115)
+        return color
+
+    def _draw_charge_cells(self, painter: QPainter, charges: np.ndarray) -> bool:
+        if (self.document.geometry not in ("square", "square3d")
+                or self.document.boundary != "periodic"
+                or self.document.lattice_constant is None
+                or len(self.document.cell_vectors) != 2):
+            return False
+        first, second = np.asarray(self.document.cell_vectors, dtype=float)
+        clip = QPainterPath(); corners = [(0, 0), first, first + second, second]
+        clip.moveTo(self.point(*corners[0]))
+        for corner in corners[1:]: clip.lineTo(self.point(*corner))
+        clip.closeSubpath()
+        painter.save(); painter.setClipPath(clip)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        half = self.document.lattice_constant / 2
+        coordination = max(self.document.vertex_coordination, default=4)
+        for vertex, charge in zip(self.document.vertex_positions, charges, strict=True):
+            for i in (-1, 0, 1):
+                for j in (-1, 0, 1):
+                    center = np.asarray(vertex[:2]) + i * first + j * second
+                    upper_left = self.point(center[0] - half, center[1] + half)
+                    lower_right = self.point(center[0] + half, center[1] - half)
+                    rect = QRectF(upper_left, lower_right).normalized()
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(self._charge_color(int(charge), coordination)))
+                    painter.drawRect(rect)
+        painter.restore()
+        return True
+
+    def _draw_charge_legend(self, painter: QPainter) -> None:
+        coordination = max(self.document.vertex_coordination, default=4)
+        charges = list(range(-coordination, coordination + 1, 2))
+        bar_width = max(32, self.options.width // 38)
+        segment_height = max(42, self.options.height // 16)
+        bar_height = segment_height * len(charges)
+        lattice_right = self.point(self.maximum[0] - self.margin, 0).x()
+        x = min(self.options.width - 132, lattice_right + 44)
+        y = (self.options.height - bar_height) / 2
+        label_font = QFont("DejaVu Math TeX Gyre" if self.tikz else self.font_family)
+        label_font.setPixelSize(max(16, self.options.height // 43))
+        painter.setFont(label_font); painter.setPen(QPen(self.foreground))
+        title_font = QFont(label_font); title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.drawText(QRectF(x - 18, y - 78, 230, 34), Qt.AlignmentFlag.AlignLeft, "topological charge")
+        painter.setFont(label_font)
+        painter.drawText(QRectF(x - 18, y - 40, 230, 32), Qt.AlignmentFlag.AlignLeft, "q = Nᵢₙ − Nₒᵤₜ")
+        for index, charge in enumerate(reversed(charges)):
+            top = y + index * segment_height
+            color = self._charge_color(charge, coordination)
+            painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QBrush(color))
+            painter.drawRect(QRectF(x, top, bar_width, segment_height + .5))
+            painter.setPen(QPen(self.foreground, .8))
+            painter.drawLine(QPointF(x + bar_width, top + segment_height / 2), QPointF(x + bar_width + 7, top + segment_height / 2))
+            text = "0" if charge == 0 else f"{charge:+d}"
+            painter.drawText(QRectF(x + bar_width + 12, top, 48, segment_height), Qt.AlignmentFlag.AlignVCenter, text)
+        painter.setBrush(Qt.BrushStyle.NoBrush); painter.setPen(QPen(self.foreground, .8))
+        painter.drawRect(QRectF(x, y, bar_width, bar_height))
+
     def render(self, table, frame_value: str, time_value: str | None, trails: list[np.ndarray]) -> QImage:
         image = self.static.copy()
         painter = QPainter(image); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         positions = self._positions(table)
+        charges = self._charges(table) if self.options.show_charges else None
+        cells_drawn = False
+        if charges is not None and self.options.charge_style == "cells":
+            cells_drawn = self._draw_charge_cells(painter, charges)
+        painter.drawImage(0, 0, self.trap_layer)
         if trails:
             history = trails + [positions]
             for segment in range(len(history) - 1):
-                color = QColor("#62b8e8"); color.setAlpha(int(35 + 145 * (segment + 1) / len(history)))
-                painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                color = QColor("#3f7f88" if self.tikz else "#62b8e8")
+                color.setAlpha(int(30 + 125 * (segment + 1) / len(history)))
+                painter.setPen(QPen(color, 1.25 if self.tikz else 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 for first, second in zip(history[segment], history[segment + 1], strict=True):
                     painter.drawLine(self.point(*first), self.point(*second))
         particle_radius = max(self.document.trap_separation * .135 * self.scale, 2.5)
-        painter.setPen(QPen(self.background, max(1.0, particle_radius * .16)))
+        particle_outline = self.foreground if self.tikz else self.background
+        painter.setPen(QPen(particle_outline, max(.7, particle_radius * (.10 if self.tikz else .16))))
         painter.setBrush(QBrush(self.particle))
         for position in positions:
             painter.drawEllipse(self.point(*position), particle_radius, particle_radius)
-        if self.options.show_charges:
-            charges = self._charges(table)
-            if charges is not None:
-                radius = max(self.document.trap_separation * .28 * self.scale, 8)
-                font = QFont("Sans Serif"); font.setBold(True); font.setPixelSize(max(9, int(radius * .72)))
-                painter.setFont(font)
-                for vertex, charge in zip(self.document.vertex_positions, charges, strict=True):
-                    if charge == 0: continue
-                    center = self.point(vertex[0], vertex[1])
-                    painter.setPen(QPen(self.background, 1.2)); painter.setBrush(self.positive if charge > 0 else self.negative)
-                    painter.drawEllipse(center, radius, radius)
-                    painter.setPen(QPen(QColor("white")))
-                    painter.drawText(QRectF(center.x()-radius, center.y()-radius, 2*radius, 2*radius), Qt.AlignmentFlag.AlignCenter, f"{charge:+d}")
-        label_font = QFont("Sans Serif"); label_font.setPixelSize(max(14, self.options.height // 48)); label_font.setBold(True)
-        painter.setFont(label_font); painter.setPen(QPen(self.foreground))
-        label = f"frame {compact_value(frame_value)}"
-        if time_value is not None: label += f"   ·   t = {compact_value(time_value)}"
-        painter.drawText(QRectF(30, 20, self.options.width - 60, 42), Qt.AlignmentFlag.AlignLeft, label)
-        painter.setFont(QFont("Sans Serif", max(9, self.options.height // 90)))
-        painter.setPen(QPen(self.muted)); painter.drawText(QRectF(30, self.options.height - 42, self.options.width - 60, 24), Qt.AlignmentFlag.AlignRight, self.document.name)
+        if charges is not None and not cells_drawn:
+            radius = max(self.document.trap_separation * .28 * self.scale, 8)
+            font = QFont("Sans Serif"); font.setBold(True); font.setPixelSize(max(9, int(radius * .72)))
+            painter.setFont(font)
+            for vertex, charge in zip(self.document.vertex_positions, charges, strict=True):
+                if charge == 0: continue
+                center = self.point(vertex[0], vertex[1])
+                painter.setPen(QPen(self.background, 1.2)); painter.setBrush(self.positive if charge > 0 else self.negative)
+                painter.drawEllipse(center, radius, radius)
+                painter.setPen(QPen(QColor("white")))
+                painter.drawText(QRectF(center.x()-radius, center.y()-radius, 2*radius, 2*radius), Qt.AlignmentFlag.AlignCenter, f"{charge:+d}")
+        if charges is not None:
+            self._draw_charge_legend(painter)
+        if self.tikz:
+            title_font = QFont(self.font_family); title_font.setPixelSize(max(15, self.options.height // 43)); title_font.setBold(True)
+            painter.setFont(title_font); painter.setPen(QPen(self.foreground))
+            title = "Square Artificial Colloidal Ice" if self.document.geometry in ("square", "square3d") else f"{self.document.geometry.title()} Artificial Colloidal Ice"
+            painter.drawText(QRectF(30, 18, self.options.width * .60, 42), Qt.AlignmentFlag.AlignLeft, title)
+        else:
+            painter.setFont(QFont(self.font_family, max(9, self.options.height // 90)))
+            painter.setPen(QPen(self.muted)); painter.drawText(QRectF(30, self.options.height - 42, self.options.width - 60, 24), Qt.AlignmentFlag.AlignRight, self.document.name)
+        # Fixed slots and tabular-width numerals prevent metadata from dancing
+        # horizontally as the frame and time values gain or lose digits.
+        label_size = max(12, self.options.height // (58 if self.tikz else 48))
+        label_font = QFont("DejaVu Math TeX Gyre" if self.tikz else self.font_family)
+        label_font.setPixelSize(label_size)
+        value_font = QFont("DejaVu Sans Mono"); value_font.setPixelSize(label_size)
+        if not self.tikz: value_font.setBold(True)
+        right = self.options.width - 30
+        time_width = max(116, self.options.width * .105)
+        frame_width = max(92, self.options.width * .075)
+        painter.setPen(QPen(self.muted if self.tikz else self.foreground))
+        if time_value is not None:
+            painter.setFont(value_font)
+            painter.drawText(QRectF(right - time_width, 20, time_width, 38), Qt.AlignmentFlag.AlignLeft, compact_value(time_value))
+            right -= time_width
+            painter.setFont(label_font)
+            painter.drawText(QRectF(right - 42, 20, 38, 38), Qt.AlignmentFlag.AlignRight, "𝑡 =")
+            right -= 56
+        painter.setFont(value_font)
+        painter.drawText(QRectF(right - frame_width, 20, frame_width, 38), Qt.AlignmentFlag.AlignLeft, compact_value(frame_value))
+        right -= frame_width
+        painter.setFont(label_font)
+        painter.drawText(QRectF(right - 58, 20, 54, 38), Qt.AlignmentFlag.AlignRight, "frame")
         painter.end()
         return image
 

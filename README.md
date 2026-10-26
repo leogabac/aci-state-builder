@@ -53,8 +53,9 @@ rpy run aci-state-builder
   or export the current view (and either side of a comparison) as scaled PNG or
   SVG with the active visual overlays.
 - Export trajectories directly to H.264 MP4 at a chosen FPS, frame stride,
-  resolution, quality, and light/dark presentation style, with optional charges
-  and trails plus cancellable progress and no temporary frame images.
+  resolution, quality, and TikZ-inspired paper, light, or dark presentation
+  style, with circle or filled-cell vertex coloring, a palette selector,
+  optional trails, cancellable progress, and no temporary frame images.
 - Use a persistent right-hand parameter pane for lattice dimensions and spacing,
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.

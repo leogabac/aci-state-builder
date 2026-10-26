@@ -11,7 +11,7 @@ from time import perf_counter
 
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPolygonF, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
@@ -661,18 +661,50 @@ class VideoExportDialog(QDialog):
         self.resolution.addItem("1920 × 1080 (Full HD)", (1920, 1080))
         self.resolution.addItem("1280 × 720 (HD)", (1280, 720))
         self.resolution.addItem("2560 × 1440 (QHD)", (2560, 1440))
-        self.theme = QComboBox(); self.theme.addItem("Presentation dark", "dark"); self.theme.addItem("Publication light", "light")
+        self.theme = QComboBox()
+        self.theme.addItem("TikZ-inspired paper", "tikz")
+        self.theme.addItem("Presentation dark", "dark")
+        self.theme.addItem("Publication light", "light")
         self.quality = QComboBox(); self.quality.addItem("Balanced", "balanced"); self.quality.addItem("Draft", "draft"); self.quality.addItem("High", "high")
         self.traps = QCheckBox("Trap bodies"); self.traps.setChecked(True)
         self.boundary = QCheckBox("Lattice boundary"); self.boundary.setChecked(True)
-        self.charges = QCheckBox("Nonzero vertex charges")
+        self.charges = QComboBox()
+        self.charges.addItem("Off", "off")
+        self.charges.addItem("Vertex circles", "circles")
+        self.charges.addItem("Filled vertex cells", "cells")
+        self.charges.setCurrentIndex(self.charges.findData("cells"))
+        self.charge_palette = QComboBox()
+        self.charge_palette.setIconSize(QSize(72, 18))
+        def palette_icon(colors: tuple[str, ...]) -> QIcon:
+            swatch = QPixmap(72, 18); swatch.fill(Qt.GlobalColor.transparent)
+            swatch_painter = QPainter(swatch)
+            width = swatch.width() / len(colors)
+            for index, color in enumerate(colors):
+                swatch_painter.fillRect(QRectF(index * width, 1, width + .5, 16), QColor(color))
+            swatch_painter.setPen(QPen(QColor("#686763"), 1))
+            swatch_painter.drawRect(QRectF(.5, .5, 71, 17))
+            swatch_painter.end()
+            return QIcon(swatch)
+        self.charge_palette.addItem(
+            palette_icon(("#496f9e", "#eee8dc", "#b65349")),
+            "Default", "blue_ivory_red",
+        )
+        self.charge_palette.addItem(
+            palette_icon(("#cd853f", "#6495ed", "#1a1b6c")),
+            "LA/AO PRR Paper", "paper_charge_magnitude",
+        )
+        self.charges.currentIndexChanged.connect(
+            lambda: self.charge_palette.setEnabled(self.charges.currentData() != "off")
+        )
         self.trails = QSpinBox(); self.trails.setRange(0, 100); self.trails.setValue(0)
         self.summary = QLabel(); self.summary.setWordWrap(True)
         form.addRow("First frame", self.start); form.addRow("Last frame", self.stop)
         form.addRow("Take every Nth frame", self.stride); form.addRow("Playback FPS", self.fps)
         form.addRow("Resolution", self.resolution); form.addRow("Visual style", self.theme)
         form.addRow("Encoding quality", self.quality)
-        form.addRow(self.traps); form.addRow(self.boundary); form.addRow(self.charges)
+        form.addRow(self.traps); form.addRow(self.boundary)
+        form.addRow("Vertex display", self.charges)
+        form.addRow("Vertex palette", self.charge_palette)
         form.addRow("Trail length (video frames)", self.trails); form.addRow(self.summary)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Choose output…")
@@ -693,7 +725,9 @@ class VideoExportDialog(QDialog):
             stride=self.stride.value(), fps=self.fps.value(), width=width, height=height,
             theme=self.theme.currentData(), quality=self.quality.currentData(),
             show_traps=self.traps.isChecked(), show_boundary=self.boundary.isChecked(),
-            show_charges=self.charges.isChecked(), trail_length=self.trails.value(),
+            show_charges=self.charges.currentData() != "off",
+            charge_style=self.charges.currentData() if self.charges.currentData() != "off" else "circles",
+            charge_palette=self.charge_palette.currentData(), trail_length=self.trails.value(),
         )
 
 
