@@ -55,7 +55,8 @@ rpy run aci-state-builder
 - Export trajectories directly to H.264 MP4 at a chosen FPS, frame stride,
   resolution, quality, and TikZ-inspired paper, light, or dark presentation
   style, with circle or filled-cell vertex coloring, a palette selector,
-  optional trails, cancellable progress, and no temporary frame images.
+  optional content-fitted output dimensions, trails, cancellable progress,
+  and no temporary frame images.
 - Use a persistent right-hand parameter pane for lattice dimensions and spacing,
   trap separation/height/stiffness, particle properties, uniform-field spherical
   coordinates, optional pair cutoff, and live interaction energy.
@@ -70,6 +71,9 @@ are deliberately separated so a native Parquet backend can be added later
 without changing trajectory playback or analysis controls.
 
 Video export requires `ffmpeg` on `PATH`; no Python video package is required.
+The TikZ-inspired style uses `latex` and `dvisvgm` for genuine TeX typography
+when available, caches the resulting SVG labels, and falls back to bundled
+desktop fonts when either command is missing.
 
 ## Tests
 

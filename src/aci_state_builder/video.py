@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from typing import Callable
@@ -14,6 +14,7 @@ from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, Q
 
 from .model import IceDocument
 from .trajectory import IndexedCsvTrajectory
+from .latex import latex_labels
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,8 @@ class VideoExportOptions:
     charge_style: str = "circles"
     charge_palette: str = "blue_ivory_red"
     trail_length: int = 0
+    framing: str = "presentation"
+    title: str = ""
 
     def positions(self) -> range:
         return range(self.start, self.stop + 1, self.stride)
@@ -53,13 +56,40 @@ class VideoExportOptions:
             raise ValueError("unknown vertex display style")
         if self.charge_palette not in ("blue_ivory_red", "paper_charge_magnitude"):
             raise ValueError("unknown charge palette")
+        if self.framing not in ("presentation", "tight"):
+            raise ValueError("unknown video framing")
         return self
+
+    def resolved(self, document: IceDocument) -> VideoExportOptions:
+        if self.framing != "tight":
+            return self
+        points = np.asarray([trap.center[:2] for trap in document.traps], dtype=float)
+        if document.cell_vectors:
+            first, second = np.asarray(document.cell_vectors, dtype=float)
+            points = np.vstack((points, [[0, 0], first, second, first + second]))
+        span = np.maximum(points.max(axis=0) - points.min(axis=0), 1e-9)
+        content_height = max(self.height - 112, 120)
+        lattice_width = content_height * span[0] / span[1]
+        legend_width = max(250, self.height * .36) if self.show_charges else 0
+        header_width = self.height * 1.17
+        width = max(lattice_width + legend_width + 86, header_width)
+        width = max(160, 2 * math.ceil(width / 2))
+        return replace(self, width=int(width))
 
 
 @dataclass(frozen=True)
 class VideoExportResult:
     path: Path
     rendered_frames: int
+
+
+def latex_escape_text(value: str) -> str:
+    replacements = {
+        "\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+        "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+        "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+    }
+    return "".join(replacements.get(character, character) for character in value)
 
 
 def compact_value(value: str) -> str:
@@ -119,13 +149,29 @@ class ScientificVideoRenderer:
         minimum, maximum = points.min(axis=0), points.max(axis=0)
         self.minimum = minimum - self.margin
         self.maximum = maximum + self.margin
-        available_w = options.width - 96
+        legend_space = max(250, options.height * .36) if options.framing == "tight" and options.show_charges else 0
+        available_w = options.width - (86 + legend_space if options.framing == "tight" else 96)
         available_h = options.height - 112
         span = np.maximum(self.maximum - self.minimum, 1e-9)
         self.scale = min(available_w / span[0], available_h / span[1])
         drawn_w, drawn_h = span * self.scale
-        self.offset_x = (options.width - drawn_w) / 2
+        self.offset_x = 43 if options.framing == "tight" else (options.width - drawn_w) / 2
         self.offset_y = (options.height - drawn_h) / 2 + 18
+        automatic_title = "Square Artificial Colloidal Ice" if document.geometry in ("square", "square3d") else f"{document.geometry.title()} Artificial Colloidal Ice"
+        title = options.title.strip() or automatic_title
+        self.title = title
+        tex_strut = r"{\color[HTML]{FFFDF7}\rule[-0.25em]{0.01pt}{1.25em}}"
+        latex_specifications = {
+            **{f"title_{index}": (rf"\textbf{{{latex_escape_text(word)}}}{tex_strut}", "292522") for index, word in enumerate(title.split())},
+            "charge_topological": (rf"\textbf{{topological}}{tex_strut}", "292522"),
+            "charge_word": (rf"\textbf{{charge}}{tex_strut}", "292522"),
+            "charge_equation": (r"$q=N_{\mathrm{in}}-N_{\mathrm{out}}$", "292522"),
+            "frame": (r"frame", "8A8179"),
+            "time": (r"$t=$", "8A8179"),
+            "x": (r"$x$", "292522"),
+            "y": (r"$y$", "292522"),
+        }
+        self.latex = latex_labels(latex_specifications) if self.tikz else None
         self.static = self._static_layer()
         self.trap_layer = self._trap_layer()
 
@@ -172,12 +218,16 @@ class ScientificVideoRenderer:
         scale_length = (1 if scaled < 2 else 2 if scaled < 5 else 5) * decade
         scale_pixels = scale_length * self.scale
         scale_y = self.options.height - 30
-        painter.setPen(QPen(self.foreground, 2))
+        bar_weight = max(2.5, self.options.height / 260)
+        tick_height = max(8, self.options.height / 78)
+        painter.setPen(QPen(self.foreground, bar_weight))
         painter.drawLine(QPointF(30, scale_y), QPointF(30 + scale_pixels, scale_y))
-        painter.drawLine(QPointF(30, scale_y - 5), QPointF(30, scale_y + 5))
-        painter.drawLine(QPointF(30 + scale_pixels, scale_y - 5), QPointF(30 + scale_pixels, scale_y + 5))
-        painter.setFont(QFont(self.font_family, max(9, self.options.height // 90)))
-        painter.drawText(QPointF(30, scale_y - 9), f"{scale_length:g} {self.unit_label()}")
+        painter.drawLine(QPointF(30, scale_y - tick_height), QPointF(30, scale_y + tick_height))
+        painter.drawLine(QPointF(30 + scale_pixels, scale_y - tick_height), QPointF(30 + scale_pixels, scale_y + tick_height))
+        scale_font = "DejaVu Math TeX Gyre" if self.tikz else self.font_family
+        scale_label_font = QFont(scale_font); scale_label_font.setPixelSize(max(14, self.options.height // 50))
+        painter.setFont(scale_label_font)
+        painter.drawText(QPointF(30, scale_y - tick_height - 7), f"{scale_length:g} {self.unit_label()}")
         if self.tikz:
             painter.setPen(QPen(self.muted, 1))
             painter.drawLine(QPointF(30, 66), QPointF(self.options.width - 30, 66))
@@ -185,9 +235,13 @@ class ScientificVideoRenderer:
             painter.setPen(QPen(self.foreground, 1.2))
             painter.drawLine(axis_origin, axis_origin + QPointF(28, 0))
             painter.drawLine(axis_origin, axis_origin + QPointF(0, -28))
-            painter.setFont(QFont(self.font_family, max(9, self.options.height // 92)))
-            painter.drawText(axis_origin + QPointF(32, 4), "x")
-            painter.drawText(axis_origin + QPointF(-3, -33), "y")
+            if self.latex:
+                self.latex["x"].draw(painter, QRectF(axis_origin.x() + 32, axis_origin.y() - 6, 15, 14))
+                self.latex["y"].draw(painter, QRectF(axis_origin.x() - 4, axis_origin.y() - 39, 15, 14))
+            else:
+                painter.setFont(QFont(self.font_family, max(9, self.options.height // 92)))
+                painter.drawText(axis_origin + QPointF(32, 4), "x")
+                painter.drawText(axis_origin + QPointF(-3, -33), "y")
         painter.end()
         return image
 
@@ -314,10 +368,19 @@ class ScientificVideoRenderer:
         label_font.setPixelSize(max(16, self.options.height // 43))
         painter.setFont(label_font); painter.setPen(QPen(self.foreground))
         title_font = QFont(label_font); title_font.setBold(True)
-        painter.setFont(title_font)
-        painter.drawText(QRectF(x - 18, y - 78, 230, 34), Qt.AlignmentFlag.AlignLeft, "topological charge")
-        painter.setFont(label_font)
-        painter.drawText(QRectF(x - 18, y - 40, 230, 32), Qt.AlignmentFlag.AlignLeft, "q = Nᵢₙ − Nₒᵤₜ")
+        if self.latex:
+            word_x = x - 18
+            keys = ("charge_topological", "charge_word")
+            scale = 28 / max(self.latex[key].height for key in keys)
+            for key in keys:
+                label = self.latex[key]
+                word_x += label.draw_natural(painter, word_x, y - 58, scale) + 8
+            self.latex["charge_equation"].draw(painter, QRectF(x - 18, y - 40, 230, 25))
+        else:
+            painter.setFont(title_font)
+            painter.drawText(QRectF(x - 18, y - 78, 230, 34), Qt.AlignmentFlag.AlignLeft, "topological charge")
+            painter.setFont(label_font)
+            painter.drawText(QRectF(x - 18, y - 40, 230, 32), Qt.AlignmentFlag.AlignLeft, "q = Nᵢₙ − Nₒᵤₜ")
         for index, charge in enumerate(reversed(charges)):
             top = y + index * segment_height
             color = self._charge_color(charge, coordination)
@@ -369,17 +432,27 @@ class ScientificVideoRenderer:
         if self.tikz:
             title_font = QFont(self.font_family); title_font.setPixelSize(max(15, self.options.height // 43)); title_font.setBold(True)
             painter.setFont(title_font); painter.setPen(QPen(self.foreground))
-            title = "Square Artificial Colloidal Ice" if self.document.geometry in ("square", "square3d") else f"{self.document.geometry.title()} Artificial Colloidal Ice"
-            painter.drawText(QRectF(30, 18, self.options.width * .60, 42), Qt.AlignmentFlag.AlignLeft, title)
+            if self.latex:
+                word_x = 30.0
+                keys = tuple(f"title_{index}" for index, _word in enumerate(self.title.split()))
+                scale = 30 / max(self.latex[key].height for key in keys)
+                natural_width = sum(self.latex[key].width * scale for key in keys) + 8 * (len(keys) - 1)
+                scale *= min(1.0, (self.options.width * .55) / max(natural_width, 1))
+                gap = 8 * min(1.0, (self.options.width * .55) / max(natural_width, 1))
+                for key in keys:
+                    word_x += self.latex[key].draw_natural(painter, word_x, 28, scale) + gap
+            else:
+                painter.drawText(QRectF(30, 18, self.options.width * .60, 42), Qt.AlignmentFlag.AlignLeft, self.title)
         else:
             painter.setFont(QFont(self.font_family, max(9, self.options.height // 90)))
             painter.setPen(QPen(self.muted)); painter.drawText(QRectF(30, self.options.height - 42, self.options.width - 60, 24), Qt.AlignmentFlag.AlignRight, self.document.name)
         # Fixed slots and tabular-width numerals prevent metadata from dancing
         # horizontally as the frame and time values gain or lose digits.
-        label_size = max(12, self.options.height // (58 if self.tikz else 48))
+        label_size = max(16, self.options.height // (43 if self.tikz else 48))
         label_font = QFont("DejaVu Math TeX Gyre" if self.tikz else self.font_family)
         label_font.setPixelSize(label_size)
-        value_font = QFont("DejaVu Sans Mono"); value_font.setPixelSize(label_size)
+        value_font = QFont("DejaVu Math TeX Gyre" if self.tikz else "DejaVu Sans Mono")
+        value_font.setPixelSize(label_size)
         if not self.tikz: value_font.setBold(True)
         right = self.options.width - 30
         time_width = max(116, self.options.width * .105)
@@ -390,13 +463,19 @@ class ScientificVideoRenderer:
             painter.drawText(QRectF(right - time_width, 20, time_width, 38), Qt.AlignmentFlag.AlignLeft, compact_value(time_value))
             right -= time_width
             painter.setFont(label_font)
-            painter.drawText(QRectF(right - 42, 20, 38, 38), Qt.AlignmentFlag.AlignRight, "𝑡 =")
+            if self.latex:
+                self.latex["time"].draw(painter, QRectF(right - 42, 19, 38, 18), Qt.AlignmentFlag.AlignRight)
+            else:
+                painter.drawText(QRectF(right - 42, 20, 38, 38), Qt.AlignmentFlag.AlignRight, "𝑡 =")
             right -= 56
         painter.setFont(value_font)
         painter.drawText(QRectF(right - frame_width, 20, frame_width, 38), Qt.AlignmentFlag.AlignLeft, compact_value(frame_value))
         right -= frame_width
         painter.setFont(label_font)
-        painter.drawText(QRectF(right - 58, 20, 54, 38), Qt.AlignmentFlag.AlignRight, "frame")
+        if self.latex:
+            self.latex["frame"].draw(painter, QRectF(right - 66, 19, 62, 18), Qt.AlignmentFlag.AlignRight)
+        else:
+            painter.drawText(QRectF(right - 58, 20, 54, 38), Qt.AlignmentFlag.AlignRight, "frame")
         painter.end()
         return image
 
@@ -406,7 +485,7 @@ def export_trajectory_video(
     options: VideoExportOptions, *, progress: Callable[[int], None] | None = None,
     cancelled: Event | None = None,
 ) -> VideoExportResult:
-    options.validated(source.metadata.frame_count)
+    options = options.resolved(document).validated(source.metadata.frame_count)
     executable = shutil.which("ffmpeg")
     if executable is None:
         raise RuntimeError("ffmpeg is required to export video")

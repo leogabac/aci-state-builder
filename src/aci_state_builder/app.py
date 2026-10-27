@@ -15,7 +15,7 @@ from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySeq
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel,
+    QFileDialog, QFormLayout, QGraphicsItem, QGraphicsScene, QGraphicsView, QLabel, QLineEdit,
     QFrame, QHBoxLayout, QInputDialog, QMainWindow, QMenu, QMessageBox, QProgressBar,
     QPushButton, QProgressDialog, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QStyle,
     QToolBar, QToolButton, QVBoxLayout, QWidget,
@@ -666,8 +666,10 @@ class VideoExportDialog(QDialog):
         self.theme.addItem("Presentation dark", "dark")
         self.theme.addItem("Publication light", "light")
         self.quality = QComboBox(); self.quality.addItem("Balanced", "balanced"); self.quality.addItem("Draft", "draft"); self.quality.addItem("High", "high")
+        self.video_title = QLineEdit(); self.video_title.setPlaceholderText("Automatic from lattice")
         self.traps = QCheckBox("Trap bodies"); self.traps.setChecked(True)
         self.boundary = QCheckBox("Lattice boundary"); self.boundary.setChecked(True)
+        self.tight_framing = QCheckBox("Tight content bounds (adjust output width)")
         self.charges = QComboBox()
         self.charges.addItem("Off", "off")
         self.charges.addItem("Vertex circles", "circles")
@@ -701,8 +703,10 @@ class VideoExportDialog(QDialog):
         form.addRow("First frame", self.start); form.addRow("Last frame", self.stop)
         form.addRow("Take every Nth frame", self.stride); form.addRow("Playback FPS", self.fps)
         form.addRow("Resolution", self.resolution); form.addRow("Visual style", self.theme)
+        form.addRow("Video title", self.video_title)
         form.addRow("Encoding quality", self.quality)
         form.addRow(self.traps); form.addRow(self.boundary)
+        form.addRow(self.tight_framing)
         form.addRow("Vertex display", self.charges)
         form.addRow("Vertex palette", self.charge_palette)
         form.addRow("Trail length (video frames)", self.trails); form.addRow(self.summary)
@@ -710,13 +714,15 @@ class VideoExportDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Choose output…")
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); form.addRow(buttons)
         for widget in (self.start, self.stop, self.stride, self.fps): widget.valueChanged.connect(self._update_summary)
+        self.tight_framing.toggled.connect(self._update_summary)
         self.start.valueChanged.connect(self.stop.setMinimum)
         self.stop.valueChanged.connect(self.start.setMaximum)
         self._update_summary()
 
     def _update_summary(self) -> None:
         count = max(0, (self.stop.value() - self.start.value()) // self.stride.value() + 1)
-        self.summary.setText(f"{count:,} rendered frames · {count / self.fps.value():.1f} seconds of video")
+        suffix = " · width fitted to content" if self.tight_framing.isChecked() else ""
+        self.summary.setText(f"{count:,} rendered frames · {count / self.fps.value():.1f} seconds of video{suffix}")
 
     def options(self) -> VideoExportOptions:
         width, height = self.resolution.currentData()
@@ -728,6 +734,8 @@ class VideoExportDialog(QDialog):
             show_charges=self.charges.currentData() != "off",
             charge_style=self.charges.currentData() if self.charges.currentData() != "off" else "circles",
             charge_palette=self.charge_palette.currentData(), trail_length=self.trails.value(),
+            framing="tight" if self.tight_framing.isChecked() else "presentation",
+            title=self.video_title.text().strip(),
         )
 
 

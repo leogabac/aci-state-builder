@@ -21,7 +21,8 @@ from aci_state_builder.app import (
 from aci_state_builder.geometry import create_lattice
 from aci_state_builder.formats import document_from_frame
 from aci_state_builder.trajectory import IndexedCsvTrajectory
-from aci_state_builder.video import VideoExportOptions, export_trajectory_video
+from aci_state_builder.video import VideoExportOptions, export_trajectory_video, latex_escape_text
+from aci_state_builder.latex import latex_labels
 
 
 class TrajectoryUiTests(unittest.TestCase):
@@ -112,8 +113,26 @@ class TrajectoryUiTests(unittest.TestCase):
         self.assertFalse(dialog.charge_palette.itemIcon(1).isNull())
         dialog.charge_palette.setCurrentIndex(dialog.charge_palette.findData("paper_charge_magnitude"))
         self.assertEqual(dialog.options().charge_palette, "paper_charge_magnitude")
+        dialog.tight_framing.setChecked(True)
+        self.assertEqual(dialog.options().framing, "tight")
+        dialog.video_title.setText("Field sweep: B_x = 3 mT")
+        self.assertEqual(dialog.options().title, "Field sweep: B_x = 3 mT")
+        tight = dialog.options().resolved(create_lattice("square", 10, 10, 30.0, 10.0))
+        self.assertLess(tight.width, 1920)
+        self.assertEqual(tight.width % 2, 0)
+        self.assertIn("width fitted to content", dialog.summary.text())
         self.assertEqual(list(options.positions()), list(range(0, 101, 10)))
         self.assertIn("11 rendered frames", dialog.summary.text())
+
+    def test_custom_video_title_is_latex_safe(self) -> None:
+        self.assertEqual(latex_escape_text("B_x & 50%"), r"B\_x \& 50\%")
+
+    @unittest.skipUnless(shutil.which("latex") and shutil.which("dvisvgm"), "LaTeX SVG tools are not installed")
+    def test_latex_video_labels_compile_to_svg(self) -> None:
+        labels = latex_labels({"charge": (r"$q=N_{\mathrm{in}}-N_{\mathrm{out}}$", "292522")})
+        self.assertIsNotNone(labels)
+        self.assertIn("charge", labels)
+        self.assertTrue(labels["charge"].renderer.isValid())
 
     def test_async_open_and_frame_change_reuse_graphics_items(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
