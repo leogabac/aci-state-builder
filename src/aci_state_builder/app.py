@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import asdict
+import json
 from pathlib import Path
 import sys
 import math
@@ -10,7 +12,7 @@ from threading import Event
 from time import perf_counter
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QRunnable, QSize, QThreadPool, QTimer, Qt, Signal, QSettings
 from PySide6.QtGui import QAction, QColor, QBrush, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (
@@ -31,7 +33,7 @@ from .model import IceDocument
 from .presets import SQUARE_CONFIGURATIONS, polarized, randomized
 from .validation import validate
 from .trajectory import IndexedCsvTrajectory, TrajectoryFormatError, TrajectorySession
-from .video import VideoExportOptions, export_trajectory_video
+from .video import VideoExportOptions, ScientificVideoRenderer, export_trajectory_video
 
 
 def compact_trajectory_value(value: str) -> str:
@@ -649,10 +651,12 @@ class NewDocumentDialog(QDialog):
 
 
 class VideoExportDialog(QDialog):
-    def __init__(self, frame_count: int, parent=None) -> None:
+    def __init__(self, frame_count: int, parent=None, *, source=None, document=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export trajectory video")
-        form = QFormLayout(self)
+        self.source, self.document = source, document
+        outer = QHBoxLayout(self)
+        form = QFormLayout(); outer.addLayout(form)
         self.start = QSpinBox(); self.start.setRange(1, frame_count); self.start.setValue(1)
         self.stop = QSpinBox(); self.stop.setRange(1, frame_count); self.stop.setValue(frame_count)
         self.stride = QSpinBox(); self.stride.setRange(1, frame_count); self.stride.setValue(1)
@@ -718,6 +722,83 @@ class VideoExportDialog(QDialog):
         self.start.valueChanged.connect(self.stop.setMinimum)
         self.stop.valueChanged.connect(self.start.setMaximum)
         self._update_summary()
+        self.preview = QLabel("Open a trajectory to preview export")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumSize(540, 300)
+        outer.addWidget(self.preview, 1)
+        self.preview_timer = QTimer(self); self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self._render_preview)
+        for widget in self.findChildren(QSpinBox):
+            widget.valueChanged.connect(lambda: self.preview_timer.start(250))
+        for widget in self.findChildren(QComboBox):
+            widget.currentIndexChanged.connect(lambda: self.preview_timer.start(250))
+        for widget in self.findChildren(QCheckBox):
+            widget.toggled.connect(lambda: self.preview_timer.start(250))
+        self.video_title.textChanged.connect(lambda: self.preview_timer.start(250))
+        self.preview_timer.start(0)
+        self.settings = QSettings("ACI", "StateBuilder")
+        self.presets = QComboBox(); self.presets.addItem("Choose preset…")
+        self.preset_values = {"Paper figure": {"theme": "tikz", "framing": "tight", "show_charges": True},
+                              "Presentation": {"theme": "dark", "framing": "presentation"},
+                              "Square video": {"width": 1080, "height": 1080, "framing": "presentation"}}
+        self.preset_values.update(json.loads(self.settings.value("export/presets", "{}")))
+        self.presets.addItems(list(self.preset_values))
+        save_preset = QPushButton("Save preset…")
+        preset_row = QWidget(); preset_layout = QHBoxLayout(preset_row); preset_layout.setContentsMargins(0, 0, 0, 0)
+        preset_layout.addWidget(self.presets); preset_layout.addWidget(save_preset)
+        form.insertRow(0, "Preset", preset_row)
+        self.presets.textActivated.connect(lambda name: self.apply_options(self.preset_values.get(name, {})))
+        save_preset.clicked.connect(self._save_preset)
+        self.apply_options(json.loads(self.settings.value("export/options", "{}")))
+
+    def apply_options(self, values) -> None:
+        for key, widget in (("fps", self.fps), ("stride", self.stride), ("trail_length", self.trails)):
+            if key in values: widget.setValue(values[key])
+        for key, widget in (("theme", self.theme), ("quality", self.quality), ("charge_palette", self.charge_palette)):
+            if key in values:
+                index = widget.findData(values[key])
+                if index >= 0: widget.setCurrentIndex(index)
+        if "width" in values and "height" in values:
+            size = (values["width"], values["height"])
+            index = self.resolution.findData(size)
+            if index < 0:
+                self.resolution.addItem(f"{size[0]} × {size[1]}", size); index = self.resolution.count() - 1
+            self.resolution.setCurrentIndex(index)
+        for key, widget in (("show_traps", self.traps), ("show_boundary", self.boundary)):
+            if key in values: widget.setChecked(values[key])
+        if "framing" in values: self.tight_framing.setChecked(values["framing"] == "tight")
+        if "title" in values: self.video_title.setText(values["title"])
+        if "show_charges" in values:
+            self.charges.setCurrentIndex(self.charges.findData(values.get("charge_style", "cells") if values["show_charges"] else "off"))
+
+    def _save_preset(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Save export preset", "Preset name")
+        if not accepted or not name.strip(): return
+        name = name.strip()
+        self.preset_values[name] = asdict(self.options())
+        self.settings.setValue("export/presets", json.dumps(self.preset_values))
+        if self.presets.findText(name) < 0: self.presets.addItem(name)
+        self.presets.setCurrentText(name)
+
+    def accept(self) -> None:
+        self.settings.setValue("export/options", json.dumps(asdict(self.options())))
+        super().accept()
+
+    def _render_preview(self) -> None:
+        if self.source is None or self.document is None:
+            return
+        try:
+            options = self.options().resolved(self.document)
+            table = self.source.load_frame(options.start)
+            entry = self.source.metadata.frames[options.start]
+            renderer = ScientificVideoRenderer(self.document, options)
+            history = [renderer._positions(self.source.load_frame(position)) for position in
+                       range(max(0, options.start - options.trail_length * options.stride), options.start, options.stride)] if options.trail_length else []
+            image = renderer.render(table, entry.value, entry.time, history)
+            self.preview.setPixmap(QPixmap.fromImage(image).scaled(540, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            self.summary.setText(self.summary.text().split(" · output:")[0] + f" · output: {options.width} × {options.height}")
+        except Exception as error:
+            self.preview.setText(f"Preview unavailable: {error}")
 
     def _update_summary(self) -> None:
         count = max(0, (self.stop.value() - self.start.value()) // self.stride.value() + 1)
@@ -843,6 +924,11 @@ class PlaybackBar(QWidget):
         self.frame_input.editingFinished.connect(
             lambda: self.seek_callback(self.frame_input.value() - 1)
         )
+        self.time_jump = QPushButton("Go to time…")
+        layout.addWidget(self.time_jump)
+        self.speed = QComboBox(); self.speed.addItems(["0.25×", "0.5×", "1×", "2×", "4×"]); self.speed.setCurrentIndex(2)
+        self.speed.setToolTip("Playback speed multiplier")
+        layout.addWidget(self.speed)
 
     def configure(self, frame_count: int) -> None:
         self.slider.setRange(0, max(frame_count - 1, 0))
@@ -1491,6 +1577,90 @@ class MainWindow(QMainWindow):
         self.seek_timer = QTimer(self); self.seek_timer.setSingleShot(True)
         self.seek_timer.timeout.connect(self._request_pending_frame)
         self._create_actions(); self._create_menus(); self._create_toolbar(); self._create_parameter_dock(); self.rebuild_scene()
+        self.settings = QSettings("ACI", "StateBuilder")
+        if self.settings.contains("window/geometry"): self.restoreGeometry(self.settings.value("window/geometry"))
+        if self.settings.contains("window/state"): self.restoreState(self.settings.value("window/state"))
+        self.charge_selector.setCurrentText(self.settings.value("view/charges", "Nonzero"))
+        self.playback.time_jump.clicked.connect(self.jump_to_time)
+        self.playback.speed.currentIndexChanged.connect(self._update_playback_interval)
+        self.parameter_panel.trajectory_pane.fps.valueChanged.connect(self._update_playback_interval)
+        overlay = self.parameter_panel.overlay_pane
+        for name in ("traps", "particles", "ids", "boundary", "scale_bar", "charge_legend"):
+            widget = getattr(overlay, name)
+            widget.setChecked(self.settings.value(f"view/{name}", widget.isChecked(), type=bool))
+        for pane in self.parameter_panel.findChildren(FoldablePane):
+            pane.header.setChecked(self.settings.value(f"panes/{pane.header.text()}", pane.header.isChecked(), type=bool))
+        trajectory = self.parameter_panel.trajectory_pane
+        for name in ("chunk_size", "cached_chunks", "fps", "stride"):
+            widget = getattr(trajectory, name)
+            widget.setValue(self.settings.value(f"playback/{name}", widget.value(), type=int))
+        self.view.transform_changed.connect(lambda _: self.update_status())
+        for shortcut, delta in (("Left", -1), ("Right", 1), ("Shift+Left", -10), ("Shift+Right", 10)):
+            action = self._action("Step trajectory", lambda checked=False, delta=delta: self.seek_trajectory(self.requested_frame + delta), QKeySequence(shortcut))
+            self.addAction(action)
+        self.welcome = QWidget()
+        welcome_layout = QVBoxLayout(self.welcome)
+        welcome_layout.addWidget(QLabel("Open a trajectory or configuration, or create a lattice to begin."))
+        for label, callback in (("Open trajectory…", self.open_trajectory), ("Open configuration…", self.import_csv), ("Create lattice…", self.new_document)):
+            button = QPushButton(label); button.clicked.connect(lambda checked=False, callback=callback: (self.welcome.hide(), callback()))
+            welcome_layout.addWidget(button)
+        self.recent_files = QComboBox(); self._refresh_recent()
+        self.recent_files.textActivated.connect(self._open_recent)
+        welcome_layout.addWidget(self.recent_files)
+        layout.insertWidget(0, self.welcome)
+
+    def closeEvent(self, event) -> None:
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/state", self.saveState())
+        self.settings.setValue("view/charges", self.charge_mode)
+        for name in ("traps", "particles", "ids", "boundary", "scale_bar", "charge_legend"):
+            self.settings.setValue(f"view/{name}", getattr(self.parameter_panel.overlay_pane, name).isChecked())
+        for pane in self.parameter_panel.findChildren(FoldablePane):
+            self.settings.setValue(f"panes/{pane.header.text()}", pane.header.isChecked())
+        for name in ("chunk_size", "cached_chunks", "fps", "stride"):
+            self.settings.setValue(f"playback/{name}", getattr(self.parameter_panel.trajectory_pane, name).value())
+        super().closeEvent(event)
+
+    def _remember_file(self, filename: str) -> None:
+        filename = str(Path(filename).resolve())
+        recent = self.settings.value("files/recent", [], type=list)
+        self.settings.setValue("files/recent", [filename] + [item for item in recent if item != filename][:9])
+        self.settings.setValue("files/directory", str(Path(filename).parent))
+        self.welcome.hide(); self._refresh_recent()
+
+    def _refresh_recent(self) -> None:
+        self.recent_files.clear(); self.recent_files.addItem("Recent files…")
+        self.recent_files.addItems(self.settings.value("files/recent", [], type=list))
+
+    def _open_recent(self, filename: str) -> None:
+        if filename == "Recent files…": return
+        if not Path(filename).exists():
+            QMessageBox.warning(self, "File unavailable", filename); return
+        if filename.endswith(".json"):
+            try: self.set_document(IceDocument.load(filename), Path(filename)); self._remember_file(filename)
+            except Exception as error: QMessageBox.warning(self, "Could not open file", str(error))
+        else:
+            try:
+                with Path(filename).open(encoding="utf-8-sig") as stream:
+                    columns = next(csv.reader(stream))
+                if "frame" in columns: self._open_trajectory_path(filename)
+                else: self.set_document(read_csv(filename)); self._remember_file(filename)
+            except Exception as error: QMessageBox.warning(self, "Could not open file", str(error))
+
+    def jump_to_time(self) -> None:
+        if self.trajectory_session is None: return
+        value, accepted = QInputDialog.getDouble(self, "Jump to time", "Simulation time", decimals=7, minValue=-1e15, maxValue=1e15)
+        if not accepted: return
+        candidates = []
+        for index, frame in enumerate(self.trajectory_session.source.metadata.frames):
+            try: candidates.append((abs(float(frame.time) - value), index))
+            except (TypeError, ValueError): pass
+        if candidates: self.seek_trajectory(min(candidates)[1])
+        else: QMessageBox.information(self, "Time unavailable", "This trajectory has no numeric time values.")
+
+    def _update_playback_interval(self) -> None:
+        speed = float(self.playback.speed.currentText().rstrip("×"))
+        self.play_timer.setInterval(max(1, round(1000 / self.parameter_panel.trajectory_pane.fps.value() / speed)))
 
     def _action(self, text: str, callback, shortcut=None) -> QAction:
         action = QAction(text, self); action.triggered.connect(callback)
@@ -1599,8 +1769,11 @@ class MainWindow(QMainWindow):
         self.charge_selector.currentTextChanged.connect(self.set_charge_mode)
         toolbar.addWidget(self.charge_selector)
         toolbar.addSeparator()
-        for action in (self.zoom_out_action, self.zoom_in_action, self.fit_action):
-            toolbar.addAction(action)
+        navigation = QToolBar("Navigation", self)
+        navigation.setObjectName("navigation-toolbar"); navigation.setMovable(False)
+        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, navigation)
+        for action in (self.zoom_out_action, self.zoom_in_action, self.fit_action, self.actual_size_action):
+            navigation.addAction(action)
         toolbar.addSeparator(); toolbar.addAction(self.export_image_action)
 
     def _create_parameter_dock(self) -> None:
@@ -1894,7 +2067,14 @@ class MainWindow(QMainWindow):
                 f"Q={int(value):+d}: {int(count)}"
                 for value, count in zip(unique, counts, strict=True)
             )
-        self.status.setText(f"  {self.document.name} | {len(self.document.traps)} traps | {selected} selected{charge_text}")
+        source = self.trajectory_session.source.path.name if self.trajectory_session else (self.project_path.name if self.project_path else self.document.name)
+        frame_text = ""
+        if self.trajectory_session and self.current_trajectory_position is not None:
+            entry = self.trajectory_session.source.metadata.frames[self.current_trajectory_position]
+            frame_text = f" | frame {compact_trajectory_value(entry.value)}"
+            if entry.time is not None: frame_text += f" · t={compact_trajectory_value(entry.time)}"
+        zoom = self.view.transform().m11() * 100
+        self.status.setText(f"  {source} | {self.document.geometry} | {len(self.document.traps)} particles | {selected} selected | zoom {zoom:.0f}%{frame_text}{charge_text}")
 
     def push_state_change(self, mutation, text: str) -> None:
         before = self.document.state_snapshot()
@@ -1985,7 +2165,7 @@ class MainWindow(QMainWindow):
 
     def open_trajectory(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Open trajectory", "", "CSV trajectories (*.csv)",
+            self, "Open trajectory", self.settings.value("files/directory", ""), "CSV trajectories (*.csv)",
             options=QFileDialog.Option(0),
         )
         if not filename:
@@ -1997,7 +2177,7 @@ class MainWindow(QMainWindow):
         if session is None:
             QMessageBox.information(self, "No trajectory", "Open a trajectory before exporting video.")
             return
-        dialog = VideoExportDialog(session.source.metadata.frame_count, self)
+        dialog = VideoExportDialog(session.source.metadata.frame_count, self, source=session.source, document=self.document)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         options = dialog.options()
@@ -2076,6 +2256,7 @@ class MainWindow(QMainWindow):
             self.trajectory_session = TrajectorySession(
                 source, pane.chunk_size.value(), pane.cached_chunks.value()
             )
+            self._remember_file(filename)
             self.requested_frame = 0
             self.current_trajectory_position = None
             pane.hide_progress(); pane.set_metadata(source.metadata)
@@ -2120,6 +2301,8 @@ class MainWindow(QMainWindow):
             return
         self.loading_chunks.add(start)
         token = self.trajectory_token
+        pane = self.parameter_panel.trajectory_pane
+        pane.progress.setRange(0, 0); pane.progress.setVisible(True)
         self.status.setText(f"  Loading trajectory frames {start + 1:,}…")
 
         def load(signals):
@@ -2132,6 +2315,8 @@ class MainWindow(QMainWindow):
             if result_token != self.trajectory_token or self.trajectory_session is not session:
                 return
             session.store_chunk(chunk)
+            pane.progress.setRange(0, 100); pane.hide_progress()
+            self._update_cache_feedback()
             self.parameter_panel.trajectory_pane.set_loaded_range(session.loaded_range())
             table = session.cached_frame(self.requested_frame)
             if table is not None:
@@ -2140,6 +2325,7 @@ class MainWindow(QMainWindow):
         def failed(message: str) -> None:
             self.loading_chunks.discard(start)
             if token == self.trajectory_token:
+                pane.progress.setRange(0, 100); pane.hide_progress()
                 self.pause_playback()
                 QMessageBox.critical(self, "Could not load trajectory frames", message)
 
@@ -2177,6 +2363,7 @@ class MainWindow(QMainWindow):
             self.rebuild_charge_overlay()
             self.update_status()
         self.current_trajectory_position = position
+        self.update_status()
         entry = session.source.metadata.frames[position]
         self.playback.show_position(position, entry.value, entry.time)
         current_text = f"frame {compact_trajectory_value(entry.value)}"
@@ -2190,6 +2377,17 @@ class MainWindow(QMainWindow):
         elif diagnostics == "Off":
             self.parameter_panel.energy_result.setText("Energy disabled during trajectory viewing")
         self._prefetch_next_chunk(position)
+
+    def _update_cache_feedback(self) -> None:
+        session = self.trajectory_session
+        if session is None: return
+        chunks = sorted(session._chunks.values(), key=lambda chunk: chunk.start)
+        ranges = ", ".join(f"{chunk.start + 1}–{chunk.start + chunk.count}" for chunk in chunks)
+        count = sum(chunk.count for chunk in chunks)
+        pane = self.parameter_panel.trajectory_pane
+        pane.loaded.setText(f"{ranges or 'None'} ({count:,} frames / {len(chunks)} chunks)")
+        size = sum(chunk.table.estimated_size() for chunk in chunks) if chunks and hasattr(chunks[0], "table") else 0
+        pane.loaded.setToolTip(f"Cached memory: {size / 2**20:.1f} MiB")
 
     def _prefetch_next_chunk(self, position: int) -> None:
         session = self.trajectory_session
@@ -2211,7 +2409,7 @@ class MainWindow(QMainWindow):
             self.loading_chunks.discard(loaded_start)
             if result_token == self.trajectory_token and self.trajectory_session is session:
                 session.store_chunk(chunk)
-                pane.set_loaded_range(session.loaded_range())
+                self._update_cache_feedback()
 
         self._run_worker(load, loaded, lambda message: self.loading_chunks.discard(start))
 
@@ -2234,8 +2432,8 @@ class MainWindow(QMainWindow):
         if self.play_timer.isActive():
             self.pause_playback()
         else:
-            fps = self.parameter_panel.trajectory_pane.fps.value()
-            self.play_timer.start(max(1, round(1000 / fps)))
+            self._update_playback_interval()
+            self.play_timer.start()
             self.playback.set_playing(True)
 
     def pause_playback(self) -> None:
@@ -2412,6 +2610,7 @@ class MainWindow(QMainWindow):
             self.export_video_action.setEnabled(False)
 
     def set_document(self, document: IceDocument, path: Path | None = None) -> None:
+        if hasattr(self, "welcome"): self.welcome.hide()
         self._leave_trajectory_mode()
         self.document, self.project_path = document, path
         self.undo_stack.clear(); self.rebuild_scene()
@@ -2422,11 +2621,11 @@ class MainWindow(QMainWindow):
 
     def open_project(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Open project", "", "ACI projects (*.aci.json *.json)",
+            self, "Open project", self.settings.value("files/directory", ""), "ACI projects (*.aci.json *.json)",
             options=QFileDialog.Option(0),
         )
         if filename:
-            try: self.set_document(IceDocument.load(filename), Path(filename))
+            try: self.set_document(IceDocument.load(filename), Path(filename)); self._remember_file(filename)
             except Exception as error: QMessageBox.critical(self, "Could not open project", str(error))
 
     def save_project(self) -> None:
@@ -2440,7 +2639,7 @@ class MainWindow(QMainWindow):
 
     def import_csv(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Import state CSV", "", "CSV files (*.csv)",
+            self, "Import state CSV", self.settings.value("files/directory", ""), "CSV files (*.csv)",
             options=QFileDialog.Option(0),
         )
         if not filename: return
@@ -2455,7 +2654,7 @@ class MainWindow(QMainWindow):
         try: document = read_csv(filename)
         except StateFormatError as error:
             QMessageBox.critical(self, "Could not import state", str(error)); return
-        self.set_document(document); issues = validate(document)
+        self.set_document(document); self._remember_file(filename); issues = validate(document)
         if issues: QMessageBox.warning(self, "Imported with warnings", "\n".join(issues[:20]))
 
     def export_csv(self) -> None:

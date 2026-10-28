@@ -71,6 +71,15 @@ are deliberately separated so a native Parquet backend can be added later
 without changing trajectory playback or analysis controls.
 
 Video export requires `ffmpeg` on `PATH`; no Python video package is required.
+The export dialog includes a live composition preview, resolved output dimensions,
+built-in Paper figure, Presentation and Square video presets, and named custom
+presets. Accepted export settings are remembered. Window layout, overlay choices,
+folded sections and playback settings are restored between launches.
+The start panel provides open/create actions and recent files. Playback supports
+nearest-time jumps, speed multipliers, Space to play/pause, Left/Right to step,
+and Shift+Left/Right to jump ten frames. The bottom navigation toolbar keeps Fit
+and 100% accessible, while the status line shows source, topology, frame/time and
+zoom. The trajectory inspector reports cached frame ranges and memory usage.
 The TikZ-inspired style uses `latex` and `dvisvgm` for genuine TeX typography
 when available, caches the resulting SVG labels, and falls back to bundled
 desktop fonts when either command is missing.

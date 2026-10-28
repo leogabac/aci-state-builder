@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, Qt, QSettings
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 
@@ -126,6 +126,19 @@ class TrajectoryUiTests(unittest.TestCase):
 
     def test_custom_video_title_is_latex_safe(self) -> None:
         self.assertEqual(latex_escape_text("B_x & 50%"), r"B\_x \& 50\%")
+
+    def test_export_settings_round_trip_preserves_square_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
+            with patch("aci_state_builder.app.QSettings", return_value=settings):
+                dialog = VideoExportDialog(20)
+                dialog.apply_options({"width": 1080, "height": 1080, "title": "Field sweep", "fps": 17})
+                dialog.accept()
+                restored = VideoExportDialog(8)
+                options = restored.options()
+                self.assertEqual((options.width, options.height), (1080, 1080))
+                self.assertEqual((options.title, options.fps), ("Field sweep", 17))
+                self.assertLess(options.stop, 8)
 
     @unittest.skipUnless(shutil.which("latex") and shutil.which("dvisvgm"), "LaTeX SVG tools are not installed")
     def test_latex_video_labels_compile_to_svg(self) -> None:
