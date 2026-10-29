@@ -10,7 +10,7 @@ import subprocess
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QBrush
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QBrush, QPolygonF
 
 from .model import IceDocument
 from .trajectory import IndexedCsvTrajectory
@@ -174,6 +174,7 @@ class ScientificVideoRenderer:
         self.latex = latex_labels(latex_specifications) if self.tikz else None
         self.static = self._static_layer()
         self.trap_layer = self._trap_layer()
+        self.charge_cells = self._build_charge_cells() if options.show_charges and options.charge_style == "cells" else []
 
     def point(self, x: float, y: float) -> QPointF:
         return QPointF(
@@ -327,37 +328,67 @@ class ScientificVideoRenderer:
         color.setAlpha(150 if self.tikz else 115)
         return color
 
+    def _build_charge_cells(self) -> list[tuple[int, np.ndarray]]:
+        """Clip the display domain into nearest-vertex (Voronoi) regions.
+
+        Periodic images compete across the cell seams. Geometry is cached once;
+        only the colors change between trajectory frames.
+        """
+        vertices = np.asarray(self.document.vertex_positions, dtype=float)
+        if not len(vertices): return []
+        vertices = vertices[:, :2]
+        a = self.document.lattice_constant or self.document.trap_separation * 3
+        periodic = self.document.boundary == "periodic" and len(self.document.cell_vectors) == 2
+        if periodic:
+            first, second = np.asarray(self.document.cell_vectors, dtype=float)
+            domain = np.asarray([[0, 0], first, first + second, second], float)
+            shifts = [i * first + j * second for i in (-1, 0, 1) for j in (-1, 0, 1)]
+        else:
+            low, high = vertices.min(axis=0) - a / 2, vertices.max(axis=0) + a / 2
+            domain = np.asarray([low, [high[0], low[1]], high, [low[0], high[1]]])
+            shifts = [np.zeros(2)]
+        candidates = np.concatenate([vertices + shift for shift in shifts])
+        cells = []
+        for number, center in enumerate(candidates):
+            polygon = domain.copy()
+            delta = candidates - center
+            distances = np.einsum("ij,ij->i", delta, delta)
+            for neighbor in np.argsort(distances):
+                if distances[neighbor] < 1e-16: continue
+                if not len(polygon): break
+                # More distant bisectors cannot intersect the remaining cell.
+                if distances[neighbor] > 4 * np.max(np.sum((polygon - center) ** 2, axis=1)) + 1e-9:
+                    break
+                normal = delta[neighbor]
+                # Points nearer this center satisfy dot(p-center, n) <= |n|²/2.
+                signed = (polygon - center) @ normal - distances[neighbor] / 2
+                if np.all(signed <= 1e-9): continue
+                clipped = []
+                for index, end in enumerate(polygon):
+                    start = polygon[index - 1]
+                    before, after = signed[index - 1], signed[index]
+                    if (before <= 0) != (after <= 0):
+                        clipped.append(start + (end - start) * before / (before - after))
+                    if after <= 0: clipped.append(end)
+                polygon = np.asarray(clipped).reshape(-1, 2)
+            if len(polygon) >= 3:
+                cells.append((number % len(vertices), polygon))
+        return cells
+
     def _draw_charge_cells(self, painter: QPainter, charges: np.ndarray) -> bool:
-        if (self.document.geometry not in ("square", "square3d")
-                or self.document.boundary != "periodic"
-                or self.document.lattice_constant is None
-                or len(self.document.cell_vectors) != 2):
-            return False
-        first, second = np.asarray(self.document.cell_vectors, dtype=float)
-        clip = QPainterPath(); corners = [(0, 0), first, first + second, second]
-        clip.moveTo(self.point(*corners[0]))
-        for corner in corners[1:]: clip.lineTo(self.point(*corner))
-        clip.closeSubpath()
-        painter.save(); painter.setClipPath(clip)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        half = self.document.lattice_constant / 2
+        if not self.charge_cells: return False
         coordination = max(self.document.vertex_coordination, default=4)
-        for vertex, charge in zip(self.document.vertex_positions, charges, strict=True):
-            for i in (-1, 0, 1):
-                for j in (-1, 0, 1):
-                    center = np.asarray(vertex[:2]) + i * first + j * second
-                    upper_left = self.point(center[0] - half, center[1] + half)
-                    lower_right = self.point(center[0] + half, center[1] - half)
-                    rect = QRectF(upper_left, lower_right).normalized()
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(QBrush(self._charge_color(int(charge), coordination)))
-                    painter.drawRect(rect)
+        painter.save(); painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for vertex, polygon in self.charge_cells:
+            painter.setBrush(QBrush(self._charge_color(int(charges[vertex]), coordination)))
+            painter.drawPolygon(QPolygonF([self.point(*point) for point in polygon]))
         painter.restore()
         return True
 
     def _draw_charge_legend(self, painter: QPainter) -> None:
         coordination = max(self.document.vertex_coordination, default=4)
-        charges = list(range(-coordination, coordination + 1, 2))
+        charges = sorted({charge for degree in self.document.vertex_coordination for charge in range(-degree, degree + 1, 2)})
         bar_width = max(32, self.options.width // 38)
         segment_height = max(42, self.options.height // 16)
         bar_height = segment_height * len(charges)
@@ -423,9 +454,10 @@ class ScientificVideoRenderer:
             for vertex, charge in zip(self.document.vertex_positions, charges, strict=True):
                 if charge == 0: continue
                 center = self.point(vertex[0], vertex[1])
-                painter.setPen(QPen(self.background, 1.2)); painter.setBrush(self.positive if charge > 0 else self.negative)
+                color = self._charge_color(int(charge), max(self.document.vertex_coordination, default=4))
+                painter.setPen(QPen(self.background, 1.2)); painter.setBrush(color)
                 painter.drawEllipse(center, radius, radius)
-                painter.setPen(QPen(QColor("white")))
+                painter.setPen(QPen(self.foreground))
                 painter.drawText(QRectF(center.x()-radius, center.y()-radius, 2*radius, 2*radius), Qt.AlignmentFlag.AlignCenter, f"{charge:+d}")
         if charges is not None:
             self._draw_charge_legend(painter)

@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 import shutil
+import numpy as np
 from threading import Thread
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ from aci_state_builder.app import (
 from aci_state_builder.geometry import create_lattice
 from aci_state_builder.formats import document_from_frame
 from aci_state_builder.trajectory import IndexedCsvTrajectory
-from aci_state_builder.video import VideoExportOptions, export_trajectory_video, latex_escape_text
+from aci_state_builder.video import VideoExportOptions, ScientificVideoRenderer, export_trajectory_video, latex_escape_text
 from aci_state_builder.latex import latex_labels
 
 
@@ -29,6 +30,14 @@ class TrajectoryUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = QSettings(str(Path(directory.name) / "preferences.ini"), QSettings.Format.IniFormat)
+        replacement = patch("aci_state_builder.app.QSettings", return_value=settings)
+        replacement.start()
+        self.addCleanup(replacement.stop)
 
     @staticmethod
     def _wait_until(predicate, timeout: float = 5.0) -> bool:
@@ -126,6 +135,22 @@ class TrajectoryUiTests(unittest.TestCase):
 
     def test_custom_video_title_is_latex_safe(self) -> None:
         self.assertEqual(latex_escape_text("B_x & 50%"), r"B\_x \& 50\%")
+
+    def test_vertex_cells_tile_all_periodic_topologies(self) -> None:
+        for geometry in ("square", "square3d", "honeycomb", "triangular"):
+            for nx, ny in ((1, 1), (3, 2)):
+                with self.subTest(geometry=geometry, size=(nx, ny)):
+                    document = create_lattice(geometry, nx, ny, 8.0, 3.0)
+                    renderer = ScientificVideoRenderer(document, VideoExportOptions(
+                        width=640, height=480, show_charges=True, charge_style="cells"))
+                    area = 0.0
+                    owners = set()
+                    for owner, polygon in renderer.charge_cells:
+                        owners.add(owner)
+                        area += abs(np.dot(polygon[:, 0], np.roll(polygon[:, 1], -1))
+                                    - np.dot(polygon[:, 1], np.roll(polygon[:, 0], -1))) / 2
+                    self.assertEqual(owners, set(range(len(document.vertex_positions))))
+                    self.assertAlmostEqual(area, abs(np.linalg.det(document.cell_vectors)), places=6)
 
     def test_export_settings_round_trip_preserves_square_preset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
